@@ -132,51 +132,86 @@ int main(int argc, char** argv)
                    output_path.c_str(), out_w, out_h, out_fps);
         }
 
-        // ---- Batched inference (batch_size from engine) ----
+        // ---- Dual-stream + batched inference ----
         double total_pre_ms = 0, total_inf_ms = 0, total_post_ms = 0;
         int frame_count = 0;
-        const int B = model.getBatchSize();  // auto-detect batch size
-        vector<Mat> images(B);
-        int slot = 0;     // single stream for batched mode
+        const int B = model.getBatchSize();
+        // Double-buffered images: 2 slots × B frames each
+        vector<Mat> images_buf[2] = {vector<Mat>(B), vector<Mat>(B)};
 
+        // --- Load first batch into slot 0 ---
+        int cur_slot = 0;
+        int cur_actual = 0;
+        for (int b = 0; b < B; b++) {
+            if (!cap.read(images_buf[cur_slot][b])) break;
+            cur_actual++;
+        }
+        if (cur_actual == 0) { cap.release(); return 0; }
+
+        // Preprocess + infer batch 0 on slot 0 (async — no host wait)
+        auto t0 = std::chrono::system_clock::now();
+        for (int b = 0; b < cur_actual; b++)
+            model.preprocess(images_buf[cur_slot][b], cur_slot, b);
+        auto t1 = std::chrono::system_clock::now();
+        model.infer(cur_slot);
+        auto t2 = std::chrono::system_clock::now();
+        total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.;
+        total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.;
+
+        // --- Pipeline loop ---
         while (true) {
-            // --- Read up to B frames ---
-            int actual_batch = 0;
+            int nxt_slot = 1 - cur_slot;
+
+            // Read next batch
+            int nxt_actual = 0;
             for (int b = 0; b < B; b++) {
-                if (!cap.read(images[b])) break;
-                actual_batch++;
+                if (!cap.read(images_buf[nxt_slot][b])) break;
+                nxt_actual++;
             }
-            if (actual_batch == 0) break;
+            if (nxt_actual == 0) break;  // no more frames
 
-            // --- Preprocess all frames in batch ---
-            auto t0 = std::chrono::system_clock::now();
-            for (int b = 0; b < actual_batch; b++) {
-                model.preprocess(images[b], slot, b);
-            }
-            auto t1 = std::chrono::system_clock::now();
+            // Launch GPU work for next batch (async on other stream)
+            auto pp0 = std::chrono::system_clock::now();
+            for (int b = 0; b < nxt_actual; b++)
+                model.preprocess(images_buf[nxt_slot][b], nxt_slot, b);
+            auto pp1 = std::chrono::system_clock::now();
+            model.infer(nxt_slot);
+            auto pp2 = std::chrono::system_clock::now();
+            total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(pp1 - pp0).count() / 1000.;
+            total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(pp2 - pp1).count() / 1000.;
 
-            // --- One inference for the whole batch ---
-            model.infer(slot);
-            auto t2 = std::chrono::system_clock::now();
-
-            total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.;
-            total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.;
-
-            // --- Postprocess each frame in batch ---
+            // --- Finish current batch (GPU should be done by now) ---
             auto tp0 = std::chrono::system_clock::now();
-            for (int b = 0; b < actual_batch; b++) {
+            for (int b = 0; b < cur_actual; b++) {
                 vector<Detection> objects;
-                model.postprocess(objects, slot, b);
-
+                model.postprocess(objects, cur_slot, b);
                 if (save_output) {
-                    model.draw(images[b], objects);
-                    video_writer.write(images[b]);
+                    model.draw(images_buf[cur_slot][b], objects);
+                    video_writer.write(images_buf[cur_slot][b]);
                 }
             }
             auto tp1 = std::chrono::system_clock::now();
             total_post_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(tp1 - tp0).count() / 1000.;
 
-            frame_count += actual_batch;
+            frame_count += cur_actual;
+            cur_slot = nxt_slot;
+            cur_actual = nxt_actual;
+        }
+
+        // --- Finish last batch ---
+        {
+            auto tp0 = std::chrono::system_clock::now();
+            for (int b = 0; b < cur_actual; b++) {
+                vector<Detection> objects;
+                model.postprocess(objects, cur_slot, b);
+                if (save_output) {
+                    model.draw(images_buf[cur_slot][b], objects);
+                    video_writer.write(images_buf[cur_slot][b]);
+                }
+            }
+            auto tp1 = std::chrono::system_clock::now();
+            total_post_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(tp1 - tp0).count() / 1000.;
+            frame_count += cur_actual;
         }
 
         // Release resources
@@ -186,7 +221,7 @@ int main(int argc, char** argv)
             printf("Output saved to: %s\n", output_path.c_str());
         }
 
-        printf("--- Batched inference (batch=%d, %d frames) ---\n", B, frame_count);
+        printf("--- Dual-stream + Batch%d (%d frames) ---\n", B, frame_count);
         printf("  preprocess:  %.2f ms/frame\n", total_pre_ms / frame_count);
         printf("  inference:   %.2f ms/batch  (%.2f ms/frame)\n",
                total_inf_ms / (frame_count / B), total_inf_ms / frame_count);
