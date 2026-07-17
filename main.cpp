@@ -140,6 +140,9 @@ int main(int argc, char** argv)
         double total_pre_ms = 0, total_inf_ms = 0, total_post_ms = 0;
         int frame_count = 0;
 
+        // Wall-clock timer for real end-to-end throughput
+        auto inference_wall_start = std::chrono::system_clock::now();
+
         // Ring buffer for original images (needed for draw + save)
         Mat images[2];
 
@@ -219,9 +222,14 @@ int main(int argc, char** argv)
         printf("  preprocess:  %.2f ms\n", total_pre_ms / frame_count);
         printf("  inference:   %.2f ms\n", total_inf_ms / frame_count);
         printf("  postprocess: %.2f ms\n", total_post_ms / frame_count);
-        printf("  total:       %.2f ms  (%.1f FPS)\n",
+        printf("  pipeline:    %.2f ms  (%.1f GPU-pipeline FPS)\n",
                (total_pre_ms + total_inf_ms + total_post_ms) / frame_count,
                1000.0 * frame_count / (total_pre_ms + total_inf_ms + total_post_ms));
+
+        auto inference_wall_end = std::chrono::system_clock::now();
+        double wall_sec = std::chrono::duration<double>(inference_wall_end - inference_wall_start).count();
+        printf("  real:        %.2f ms/frame  (%.1f end-to-end FPS, %.1fs wall clock)\n",
+               1000.0 * wall_sec / frame_count, frame_count / wall_sec, wall_sec);
     }
     else{
         printf("not video\n");
