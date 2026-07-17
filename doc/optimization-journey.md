@@ -418,7 +418,49 @@ Slot 1 (stream1):                        [pre 4帧] [infer batch4] ════�
 >
 > **结论：看总耗时，别看 FPS。** 同步版 FPS 是 GPU 理论峰值，不含 I/O；
 > 异步版 FPS 是含 I/O 的真实吞吐，总时间才是最终指标。
+### 7.6 解码瓶颈分析：软件 vs 硬件
 
+使用 `ffmpeg` 测量纯解码吞吐（`-f null` 丢弃解码帧，不计渲染）：
+
+```bash
+# 软件解码 (CPU)
+ffmpeg -i video.mp4 -f null -
+
+# 硬件解码 (NVDEC)
+ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i video.mp4 -f null -
+```
+
+**测试视频**: 7d5d...mp4，16499 帧，1080p H.264
+
+| 解码方式 | 纯解码速度 | vs 视频帧率 | CPU 占用 |
+|------|------|------|------|
+| CPU 软件解码 (ffmpeg) | **750 fps** | 25× | 2049%（全核满载） |
+| **NVDEC 硬解 (ffmpeg)** | **1836 fps** | **61×** | 55%（几乎空闲） |
+
+> NVDEC 硬解速度是 CPU 软解的 **2.45 倍**，且 CPU 几乎空载。
+
+**为什么 C++ 程序实测只有 589 fps（而非 750）？**
+
+`cv::VideoCapture` 相比原生 ffmpeg 多了两层开销：
+
+```
+ffmpeg 纯解码:     750 fps  ← 只是解码+丢弃
+cv::VideoCapture:  589 fps  ← 解码 + BGR转换 + cv::Mat构造 + 内存拷贝
+                                                                   ↑
+                                                              ~0.74ms/帧 额外开销
+```
+
+**实际管线耗时分解（1080p 视频，batch=4）**:
+
+```
+每帧 1.70ms:
+  ├── 视频解码 (cv::VideoCapture)   0.74 ms  43%
+  ├── GPU preprocess                0.68 ms  40%
+  ├── GPU inference                 0.18 ms  11%
+  └── GPU postprocess               0.10 ms   6%
+```
+
+若改用 NVDEC + FFmpeg 管道，解码耗时 0.74ms → ~0.01ms，预计真实吞吐可从 589 fps → **900+ fps**。
 ---
 
 ## 8. Batch 大小的甜点分析
