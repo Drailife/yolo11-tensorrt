@@ -221,6 +221,9 @@ int main(int argc, char** argv)
         double total_pre_ms = 0, total_inf_ms = 0, total_post_ms = 0;
         int frame_count = 0;
         const int B = model.getBatchSize();
+
+        // Wall-clock timer: measures real end-to-end throughput including I/O
+        auto inference_wall_start = std::chrono::system_clock::now();
         // Double-buffered images: 2 slots × B frames each
         vector<Mat> images_buf[2] = {vector<Mat>(B), vector<Mat>(B)};
 
@@ -313,9 +316,15 @@ int main(int argc, char** argv)
         printf("  inference:   %.2f ms/batch  (%.2f ms/frame)\n",
                total_inf_ms / (frame_count / B), total_inf_ms / frame_count);
         printf("  postprocess: %.2f ms/frame\n", total_post_ms / frame_count);
-        printf("  total:       %.2f ms/frame  (%.1f FPS)\n",
+        printf("  pipeline:    %.2f ms/frame  (%.1f GPU-pipeline FPS)\n",
                (total_pre_ms + total_inf_ms + total_post_ms) / frame_count,
                1000.0 * frame_count / (total_pre_ms + total_inf_ms + total_post_ms));
+
+        // Real end-to-end throughput: wall clock from first frame to last frame
+        auto inference_wall_end = std::chrono::system_clock::now();
+        double wall_sec = std::chrono::duration<double>(inference_wall_end - inference_wall_start).count();
+        printf("  real:        %.2f ms/frame  (%.1f end-to-end FPS, %.1fs wall clock)\n",
+               1000.0 * wall_sec / frame_count, frame_count / wall_sec, wall_sec);
     }
     else{
         printf("not video\n");
