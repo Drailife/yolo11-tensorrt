@@ -17,28 +17,20 @@ static Logger logger;
 
 YOLOv11::YOLOv11(string model_path, nvinfer1::ILogger& logger)
 {
-    // Deserialize an engine
     if (model_path.find(".onnx") == std::string::npos)
     {
+        // Load pre-built engine
         init(model_path, logger);
     }
-    // Build an engine from an onnx model
     else
     {
+        // Build engine from ONNX
         build(model_path, logger);
-        saveEngine(model_path);
-    }
 
-#if NV_TENSORRT_MAJOR < 10
-    // Define input dimensions
-    auto input_dims = engine->getBindingDimensions(0);
-    input_h = input_dims.d[2];
-    input_w = input_dims.d[3];
-#else
-    auto input_dims = engine->getTensorShape(engine->getIOTensorName(0));
-    input_h = input_dims.d[2];
-    input_w = input_dims.d[3];
-#endif
+        // Re-load the engine we just built to set up inference resources
+        string engine_path = model_path.substr(0, model_path.find_last_of(".")) + ".engine";
+        init(engine_path, logger);
+    }
 }
 
 
@@ -53,12 +45,11 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
     engineStream.read(engineData.get(), modelSize);
     engineStream.close();
 
-    // Deserialize the tensorrt engine
+    // Deserialize the tensorrt engine (shared across all contexts)
     runtime = createInferRuntime(logger);
     engine = runtime->deserializeCudaEngine(engineData.get(), modelSize);
-    context = engine->createExecutionContext();
 
-    // Get input and output sizes of the model
+    // Get input and output sizes of the model (same for all slots)
 #if NV_TENSORRT_MAJOR < 10
     input_h = engine->getBindingDimensions(0).d[2];
     input_w = engine->getBindingDimensions(0).d[3];
@@ -74,30 +65,36 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
 #endif
     num_classes = detection_attribute_size - 4;
 
-    // Initialize input buffers
-    CUDA_CHECK(cudaMalloc(&gpu_buffers[0], 3 * input_w * input_h * sizeof(float)));
-    // Initialize output buffer
-    CUDA_CHECK(cudaMalloc(&gpu_buffers[1], detection_attribute_size * num_detections * sizeof(float)));
+    // ---- Per-slot initialization (2 slots for pipelining) ----
+    for (int s = 0; s < NUM_STREAMS; s++) {
+        // Context per slot
+        contexts[s] = engine->createExecutionContext();
+
+        // GPU buffers: input (float RGB) + output (raw detections)
+        CUDA_CHECK(cudaMalloc(&gpu_buffers[s][0], 3 * input_w * input_h * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&gpu_buffers[s][1], detection_attribute_size * num_detections * sizeof(float)));
 
 #if NV_TENSORRT_MAJOR >= 10
-    // For TensorRT 10.x, set tensor addresses before enqueueV3
-    context->setInputTensorAddress(engine->getIOTensorName(0), gpu_buffers[0]);
-    context->setOutputTensorAddress(engine->getIOTensorName(1), gpu_buffers[1]);
+        contexts[s]->setInputTensorAddress(engine->getIOTensorName(0), gpu_buffers[s][0]);
+        contexts[s]->setOutputTensorAddress(engine->getIOTensorName(1), gpu_buffers[s][1]);
 #endif
 
-    // Allocate GPU postprocess buffers
-    CUDA_CHECK(cudaMalloc(&gpu_filtered_boxes, MAX_OUTPUT_DETECTIONS * 6 * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&gpu_filtered_count, sizeof(int)));
-    cpu_filtered_boxes = new float[MAX_OUTPUT_DETECTIONS * 6];
+        // Postprocess GPU buffers
+        CUDA_CHECK(cudaMalloc(&gpu_filtered_boxes[s], MAX_OUTPUT_DETECTIONS * 6 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&gpu_filtered_count[s], sizeof(int)));
+        cpu_filtered_boxes[s] = new float[MAX_OUTPUT_DETECTIONS * 6];
+
+        // Stream + event per slot
+        CUDA_CHECK(cudaStreamCreate(&streams[s]));
+        CUDA_CHECK(cudaEventCreate(&events[s]));
+    }
 
     cuda_preprocess_init(MAX_IMAGE_SIZE);
 
-    CUDA_CHECK(cudaStreamCreate(&stream));
-
-
+    // Warmup on slot 0
     if (warmup) {
         for (int i = 0; i < 2; i++) {
-            this->infer();
+            this->infer(0);
         }
         printf("model warmup 2 times\n");
     }
@@ -107,73 +104,74 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
 
 YOLOv11::~YOLOv11()
 {
-    // Only release inference resources if init() was called
     if (inference_initialized) {
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaStreamDestroy(stream));
-        for (int i = 0; i < 2; i++)
-            CUDA_CHECK(cudaFree(gpu_buffers[i]));
-        CUDA_CHECK(cudaFree(gpu_filtered_boxes));
-        CUDA_CHECK(cudaFree(gpu_filtered_count));
-        delete[] cpu_filtered_boxes;
+        for (int s = 0; s < NUM_STREAMS; s++) {
+            CUDA_CHECK(cudaStreamSynchronize(streams[s]));
+            CUDA_CHECK(cudaStreamDestroy(streams[s]));
+            CUDA_CHECK(cudaEventDestroy(events[s]));
+            CUDA_CHECK(cudaFree(gpu_buffers[s][0]));
+            CUDA_CHECK(cudaFree(gpu_buffers[s][1]));
+            CUDA_CHECK(cudaFree(gpu_filtered_boxes[s]));
+            CUDA_CHECK(cudaFree(gpu_filtered_count[s]));
+            delete[] cpu_filtered_boxes[s];
+            delete contexts[s];
+        }
         cuda_preprocess_destroy();
     }
 
-    // Destroy TensorRT objects (always created, both in build() and init())
-    delete context;
+    // Engine and runtime are shared, always created
     delete engine;
     delete runtime;
 }
 
-void YOLOv11::preprocess(Mat& image) {
-    // Preprocessing data on gpu
-    cuda_preprocess(image.ptr(), image.cols, image.rows, gpu_buffers[0], input_w, input_h, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+void YOLOv11::preprocess(Mat& image, int slot) {
+    // Launch GPU preprocess on stream[slot] — fully async, no host sync
+    cuda_preprocess(image.ptr(), image.cols, image.rows,
+                    gpu_buffers[slot][0], input_w, input_h, streams[slot]);
 }
 
-void YOLOv11::infer()
+void YOLOv11::infer(int slot)
 {
 #if NV_TENSORRT_MAJOR < 10
-    context->enqueueV2((void**)gpu_buffers, stream, nullptr);
+    contexts[slot]->enqueueV2((void**)gpu_buffers[slot], streams[slot], nullptr);
 #else
-    this->context->enqueueV3(this->stream);
+    contexts[slot]->enqueueV3(streams[slot]);
 #endif
 }
 
-void YOLOv11::postprocess(vector<Detection>& output)
+void YOLOv11::postprocess(vector<Detection>& output, int slot)
 {
-    // ----- Step 1: Zero the atomic counter on GPU -----
-    CUDA_CHECK(cudaMemsetAsync(gpu_filtered_count, 0, sizeof(int), stream));
+    // ----- Step 1: Zero atomic counter on GPU (async on stream[slot]) -----
+    CUDA_CHECK(cudaMemsetAsync(gpu_filtered_count[slot], 0, sizeof(int), streams[slot]));
 
-    // ----- Step 2: GPU kernel: decode boxes + filter by confidence -----
+    // ----- Step 2: GPU kernel: decode boxes + filter by confidence (async) -----
     cuda_postprocess_decode(
-        gpu_buffers[1],          // raw model output on GPU
-        gpu_filtered_boxes,      // filtered output on GPU
-        gpu_filtered_count,      // atomic counter
-        num_detections,
-        num_classes,
-        detection_attribute_size,
-        conf_threshold,
-        MAX_OUTPUT_DETECTIONS,
-        stream
+        gpu_buffers[slot][1],
+        gpu_filtered_boxes[slot],
+        gpu_filtered_count[slot],
+        num_detections, num_classes, detection_attribute_size,
+        conf_threshold, MAX_OUTPUT_DETECTIONS,
+        streams[slot]
     );
 
-    // ----- Step 3: Copy filtered count back to CPU -----
+    // ----- Step 3: Copy filtered count back to CPU (async) -----
     int filtered_count = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&filtered_count, gpu_filtered_count, sizeof(int),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpyAsync(&filtered_count, gpu_filtered_count[slot], sizeof(int),
+                               cudaMemcpyDeviceToHost, streams[slot]));
+
+    // ----- Step 4: Sync: wait for all GPU work on this slot -----
+    CUDA_CHECK(cudaStreamSynchronize(streams[slot]));
 
     if (filtered_count == 0) return;
     if (filtered_count > MAX_OUTPUT_DETECTIONS) filtered_count = MAX_OUTPUT_DETECTIONS;
 
-    // ----- Step 4: Copy only the filtered detections to CPU -----
-    CUDA_CHECK(cudaMemcpyAsync(cpu_filtered_boxes, gpu_filtered_boxes,
+    // ----- Step 5: Copy filtered detections (GPU is done, safe to use sync memcpy) -----
+    CUDA_CHECK(cudaMemcpyAsync(cpu_filtered_boxes[slot], gpu_filtered_boxes[slot],
                                filtered_count * 6 * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+                               cudaMemcpyDeviceToHost, streams[slot]));
+    CUDA_CHECK(cudaStreamSynchronize(streams[slot]));
 
-    // ----- Step 5: Build detection lists for NMS (now very few boxes) -----
+    // ----- Step 6: Build detection lists + CPU NMS -----
     vector<Rect> boxes;
     vector<int> class_ids;
     vector<float> confidences;
@@ -182,12 +180,12 @@ void YOLOv11::postprocess(vector<Detection>& output)
     confidences.reserve(filtered_count);
 
     for (int i = 0; i < filtered_count; i++) {
-        float x    = cpu_filtered_boxes[i * 6 + 0];
-        float y    = cpu_filtered_boxes[i * 6 + 1];
-        float w    = cpu_filtered_boxes[i * 6 + 2];
-        float h    = cpu_filtered_boxes[i * 6 + 3];
-        float conf = cpu_filtered_boxes[i * 6 + 4];
-        int   cls  = (int)cpu_filtered_boxes[i * 6 + 5];
+        float x    = cpu_filtered_boxes[slot][i * 6 + 0];
+        float y    = cpu_filtered_boxes[slot][i * 6 + 1];
+        float w    = cpu_filtered_boxes[slot][i * 6 + 2];
+        float h    = cpu_filtered_boxes[slot][i * 6 + 3];
+        float conf = cpu_filtered_boxes[slot][i * 6 + 4];
+        int   cls  = (int)cpu_filtered_boxes[slot][i * 6 + 5];
 
         Rect box;
         box.x = static_cast<int>(x);
@@ -200,7 +198,6 @@ void YOLOv11::postprocess(vector<Detection>& output)
         confidences.push_back(conf);
     }
 
-    // ----- Step 6: CPU NMS on the small filtered set -----
     vector<int> nms_result;
     dnn::NMSBoxes(boxes, confidences, conf_threshold, nms_threshold, nms_result);
 
@@ -213,6 +210,11 @@ void YOLOv11::postprocess(vector<Detection>& output)
         result.bbox = boxes[idx];
         output.push_back(result);
     }
+}
+
+void YOLOv11::syncSlot(int slot)
+{
+    CUDA_CHECK(cudaStreamSynchronize(streams[slot]));
 }
 
 void YOLOv11::build(std::string onnxPath, nvinfer1::ILogger& logger)
@@ -234,51 +236,20 @@ void YOLOv11::build(std::string onnxPath, nvinfer1::ILogger& logger)
 #endif
     }
     nvonnxparser::IParser* parser = nvonnxparser::createParser(*network, logger);
-    bool parsed = parser->parseFromFile(onnxPath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kINFO));
+    parser->parseFromFile(onnxPath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kINFO));
     IHostMemory* plan{ builder->buildSerializedNetwork(*network, *config) };
 
-    runtime = createInferRuntime(logger);
+    // Write the serialized engine to file (engine will be loaded later by init())
+    string engine_path = onnxPath.substr(0, onnxPath.find_last_of(".")) + ".engine";
+    std::ofstream file(engine_path, std::ios::binary | std::ios::out);
+    file.write((const char*)plan->data(), plan->size());
+    file.close();
 
-    engine = runtime->deserializeCudaEngine(plan->data(), plan->size());
-
-    context = engine->createExecutionContext();
-
-    delete network;
-    delete config;
-    delete parser;
     delete plan;
-}
-
-bool YOLOv11::saveEngine(const std::string& onnxpath)
-{
-    // Create an engine path from onnx path
-    std::string engine_path;
-    size_t dotIndex = onnxpath.find_last_of(".");
-    if (dotIndex != std::string::npos) {
-        engine_path = onnxpath.substr(0, dotIndex) + ".engine";
-    }
-    else
-    {
-        return false;
-    }
-
-    // Save the engine to the path
-    if (engine)
-    {
-        nvinfer1::IHostMemory* data = engine->serialize();
-        std::ofstream file;
-        file.open(engine_path, std::ios::binary | std::ios::out);
-        if (!file.is_open())
-        {
-            std::cout << "Create engine file" << engine_path << " failed" << std::endl;
-            return 0;
-        }
-        file.write((const char*)data->data(), data->size());
-        file.close();
-
-        delete data;
-    }
-    return true;
+    delete parser;
+    delete config;
+    delete network;
+    delete builder;
 }
 
 void YOLOv11::draw(Mat& image, const vector<Detection>& output)

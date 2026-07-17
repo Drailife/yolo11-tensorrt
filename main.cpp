@@ -114,13 +114,12 @@ int main(int argc, char** argv)
     YOLOv11 model(engine_file_path, logger);
 
     if (isVideo) {
-        //path to video
         cv::VideoCapture cap(path);
 
         // Setup video writer if saving output
         cv::VideoWriter video_writer;
         if (save_output) {
-            int codec = cv::VideoWriter::fourcc('a', 'v', 'c', '1');  // H.264
+            int codec = cv::VideoWriter::fourcc('a', 'v', 'c', '1');
             double out_fps = cap.get(cv::CAP_PROP_FPS);
             int out_w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
             int out_h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
@@ -133,54 +132,83 @@ int main(int argc, char** argv)
                    output_path.c_str(), out_w, out_h, out_fps);
         }
 
+        // ---- Pipelined 2-stream double-buffered processing ----
+        //  Slot 0  |  Slot 1
+        //  stream0 |  stream1
+        //  GPU work for even-ish frames | GPU work for odd-ish frames
+        //  Host overlaps: while CPU does NMS for slot 0, GPU does slot 1
         double total_pre_ms = 0, total_inf_ms = 0, total_post_ms = 0;
         int frame_count = 0;
 
-        while (1)
-        {
-            Mat image;
-            cap >> image;
+        // Ring buffer for original images (needed for draw + save)
+        Mat images[2];
 
-            if (image.empty()) break;
+        // Read first frame
+        if (!cap.read(images[0])) {
+            printf("Error: video has no frames\n");
+            return 1;
+        }
 
+        // Launch frame 0 on slot 0 (pre + infer async, GPU only)
+        int cur_slot = 0;
+        auto t0 = std::chrono::system_clock::now();
+        model.preprocess(images[cur_slot], cur_slot);
+        auto t1 = std::chrono::system_clock::now();
+        model.infer(cur_slot);
+        auto t2 = std::chrono::system_clock::now();
+        total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.;
+        total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.;
+
+        // Pipeline loop
+        while (true) {
+            int nxt_slot = 1 - cur_slot;
+
+            // Read next frame (or break if no more)
+            if (!cap.read(images[nxt_slot])) break;
+
+            // Launch GPU work for next frame on the OTHER slot
+            // (GPU can do this while CPU processes cur_slot's results)
+            auto t0_n = std::chrono::system_clock::now();
+            model.preprocess(images[nxt_slot], nxt_slot);
+            auto t1_n = std::chrono::system_clock::now();
+            model.infer(nxt_slot);
+            auto t2_n = std::chrono::system_clock::now();
+            total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t1_n - t0_n).count() / 1000.;
+            total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t2_n - t1_n).count() / 1000.;
+
+            // --- Finish current slot (GPU already working on it) ---
             vector<Detection> objects;
+            auto tp0 = std::chrono::system_clock::now();
+            model.postprocess(objects, cur_slot);
+            auto tp1 = std::chrono::system_clock::now();
+            total_post_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(tp1 - tp0).count() / 1000.;
 
-            auto t0 = std::chrono::system_clock::now();
-            model.preprocess(image);
-            auto t1 = std::chrono::system_clock::now();
-            model.infer();
-            auto t2 = std::chrono::system_clock::now();
-            model.postprocess(objects);
-            auto t3 = std::chrono::system_clock::now();
-            // 打印objects
-            // for (const auto& obj : objects) {
-            //     printf("class_id: %d, conf: %.2f, bbox: [%d, %d, %d, %d]\n",
-            //         obj.class_id, obj.conf,
-            //         obj.bbox.x, obj.bbox.y,
-            //         obj.bbox.width, obj.bbox.height);
-            // }
-
-            // Save frame if output is enabled
+            // Draw and save current frame
             if (save_output) {
-                model.draw(image, objects);
-                video_writer.write(image);
+                model.draw(images[cur_slot], objects);
+                video_writer.write(images[cur_slot]);
             }
 
-            auto pre_ms  = (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.;
-            auto inf_ms  = (double)std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.;
-            auto post_ms = (double)std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count() / 1000.;
-            total_pre_ms += pre_ms;
-            total_inf_ms += inf_ms;
-            total_post_ms += post_ms;
             frame_count++;
-            // 保存图片
-            // imwrite("output.jpg", image);
-            // imshow("prediction", image);
-            // waitKey(1);
+            cur_slot = nxt_slot;
+        }
+
+        // Finish the last frame (still on cur_slot)
+        {
+            vector<Detection> objects;
+            auto tp0 = std::chrono::system_clock::now();
+            model.postprocess(objects, cur_slot);
+            auto tp1 = std::chrono::system_clock::now();
+            total_post_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(tp1 - tp0).count() / 1000.;
+
+            if (save_output) {
+                model.draw(images[cur_slot], objects);
+                video_writer.write(images[cur_slot]);
+            }
+            frame_count++;
         }
 
         // Release resources
-        // destroyAllWindows();
         cap.release();
         if (save_output) {
             video_writer.release();
