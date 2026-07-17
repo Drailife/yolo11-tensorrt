@@ -57,6 +57,7 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
     num_detections = engine->getBindingDimensions(1).d[2];
 #else
     auto input_dims = engine->getTensorShape(engine->getIOTensorName(0));
+    batch_size = input_dims.d[0];
     input_h = input_dims.d[2];
     input_w = input_dims.d[3];
     auto output_dims = engine->getTensorShape(engine->getIOTensorName(1));
@@ -64,15 +65,17 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
     num_detections = output_dims.d[2];
 #endif
     num_classes = detection_attribute_size - 4;
+    printf("Model: batch=%d, input=%dx%d, det_attr=%d, num_dets=%d, classes=%d\n",
+           batch_size, input_w, input_h, detection_attribute_size, num_detections, num_classes);
 
     // ---- Per-slot initialization (2 slots for pipelining) ----
     for (int s = 0; s < NUM_STREAMS; s++) {
         // Context per slot
         contexts[s] = engine->createExecutionContext();
 
-        // GPU buffers: input (float RGB) + output (raw detections)
-        CUDA_CHECK(cudaMalloc(&gpu_buffers[s][0], 3 * input_w * input_h * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&gpu_buffers[s][1], detection_attribute_size * num_detections * sizeof(float)));
+        // GPU buffers: input [batch * 3 * H * W] + output [batch * det_attr * num_dets]
+        CUDA_CHECK(cudaMalloc(&gpu_buffers[s][0], batch_size * 3 * input_w * input_h * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&gpu_buffers[s][1], batch_size * detection_attribute_size * num_detections * sizeof(float)));
 
 #if NV_TENSORRT_MAJOR >= 10
         contexts[s]->setInputTensorAddress(engine->getIOTensorName(0), gpu_buffers[s][0]);
@@ -124,10 +127,11 @@ YOLOv11::~YOLOv11()
     delete runtime;
 }
 
-void YOLOv11::preprocess(Mat& image, int slot) {
-    // Launch GPU preprocess on stream[slot] — fully async, no host sync
+void YOLOv11::preprocess(Mat& image, int slot, int batch_idx) {
+    // Launch GPU preprocess on stream[slot] — writes to batch slot
+    float* dst = gpu_buffers[slot][0] + batch_idx * 3 * input_w * input_h;
     cuda_preprocess(image.ptr(), image.cols, image.rows,
-                    gpu_buffers[slot][0], input_w, input_h, streams[slot]);
+                    dst, input_w, input_h, streams[slot]);
 }
 
 void YOLOv11::infer(int slot)
@@ -139,14 +143,18 @@ void YOLOv11::infer(int slot)
 #endif
 }
 
-void YOLOv11::postprocess(vector<Detection>& output, int slot)
+void YOLOv11::postprocess(vector<Detection>& output, int slot, int batch_idx)
 {
+    // Raw output for this batch element: offset in the full batched buffer
+    int per_image_size = detection_attribute_size * num_detections;
+    float* raw_output = gpu_buffers[slot][1] + batch_idx * per_image_size;
+
     // ----- Step 1: Zero atomic counter on GPU (async on stream[slot]) -----
     CUDA_CHECK(cudaMemsetAsync(gpu_filtered_count[slot], 0, sizeof(int), streams[slot]));
 
     // ----- Step 2: GPU kernel: decode boxes + filter by confidence (async) -----
     cuda_postprocess_decode(
-        gpu_buffers[slot][1],
+        raw_output,
         gpu_filtered_boxes[slot],
         gpu_filtered_count[slot],
         num_detections, num_classes, detection_attribute_size,
@@ -237,6 +245,28 @@ void YOLOv11::build(std::string onnxPath, nvinfer1::ILogger& logger)
     }
     nvonnxparser::IParser* parser = nvonnxparser::createParser(*network, logger);
     parser->parseFromFile(onnxPath.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kINFO));
+
+    // Set optimization profile only if input has dynamic dimensions
+    auto input_dims = network->getInput(0)->getDimensions();
+    bool has_dynamic = false;
+    for (int i = 0; i < input_dims.nbDims; i++) {
+        if (input_dims.d[i] < 0) { has_dynamic = true; break; }
+    }
+    if (has_dynamic) {
+        auto profile = builder->createOptimizationProfile();
+        profile->setDimensions(network->getInput(0)->getName(), OptProfileSelector::kMIN,
+                               Dims4{1, input_dims.d[1], input_dims.d[2], input_dims.d[3]});
+        profile->setDimensions(network->getInput(0)->getName(), OptProfileSelector::kOPT,
+                               Dims4{4, input_dims.d[1], input_dims.d[2], input_dims.d[3]});
+        profile->setDimensions(network->getInput(0)->getName(), OptProfileSelector::kMAX,
+                               Dims4{4, input_dims.d[1], input_dims.d[2], input_dims.d[3]});
+        config->addOptimizationProfile(profile);
+        printf("Optimization profile: MIN=[1,%d,%d,%d] OPT=[4,%d,%d,%d] MAX=[4,%d,%d,%d]\n",
+               input_dims.d[1], input_dims.d[2], input_dims.d[3],
+               input_dims.d[1], input_dims.d[2], input_dims.d[3],
+               input_dims.d[1], input_dims.d[2], input_dims.d[3]);
+    }
+
     IHostMemory* plan{ builder->buildSerializedNetwork(*network, *config) };
 
     // Write the serialized engine to file (engine will be loaded later by init())

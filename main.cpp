@@ -132,80 +132,51 @@ int main(int argc, char** argv)
                    output_path.c_str(), out_w, out_h, out_fps);
         }
 
-        // ---- Pipelined 2-stream double-buffered processing ----
-        //  Slot 0  |  Slot 1
-        //  stream0 |  stream1
-        //  GPU work for even-ish frames | GPU work for odd-ish frames
-        //  Host overlaps: while CPU does NMS for slot 0, GPU does slot 1
+        // ---- Batched inference (batch_size from engine) ----
         double total_pre_ms = 0, total_inf_ms = 0, total_post_ms = 0;
         int frame_count = 0;
+        const int B = model.getBatchSize();  // auto-detect batch size
+        vector<Mat> images(B);
+        int slot = 0;     // single stream for batched mode
 
-        // Ring buffer for original images (needed for draw + save)
-        Mat images[2];
-
-        // Read first frame
-        if (!cap.read(images[0])) {
-            printf("Error: video has no frames\n");
-            return 1;
-        }
-
-        // Launch frame 0 on slot 0 (pre + infer async, GPU only)
-        int cur_slot = 0;
-        auto t0 = std::chrono::system_clock::now();
-        model.preprocess(images[cur_slot], cur_slot);
-        auto t1 = std::chrono::system_clock::now();
-        model.infer(cur_slot);
-        auto t2 = std::chrono::system_clock::now();
-        total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.;
-        total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.;
-
-        // Pipeline loop
         while (true) {
-            int nxt_slot = 1 - cur_slot;
+            // --- Read up to B frames ---
+            int actual_batch = 0;
+            for (int b = 0; b < B; b++) {
+                if (!cap.read(images[b])) break;
+                actual_batch++;
+            }
+            if (actual_batch == 0) break;
 
-            // Read next frame (or break if no more)
-            if (!cap.read(images[nxt_slot])) break;
+            // --- Preprocess all frames in batch ---
+            auto t0 = std::chrono::system_clock::now();
+            for (int b = 0; b < actual_batch; b++) {
+                model.preprocess(images[b], slot, b);
+            }
+            auto t1 = std::chrono::system_clock::now();
 
-            // Launch GPU work for next frame on the OTHER slot
-            // (GPU can do this while CPU processes cur_slot's results)
-            auto t0_n = std::chrono::system_clock::now();
-            model.preprocess(images[nxt_slot], nxt_slot);
-            auto t1_n = std::chrono::system_clock::now();
-            model.infer(nxt_slot);
-            auto t2_n = std::chrono::system_clock::now();
-            total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t1_n - t0_n).count() / 1000.;
-            total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t2_n - t1_n).count() / 1000.;
+            // --- One inference for the whole batch ---
+            model.infer(slot);
+            auto t2 = std::chrono::system_clock::now();
 
-            // --- Finish current slot (GPU already working on it) ---
-            vector<Detection> objects;
+            total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.;
+            total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.;
+
+            // --- Postprocess each frame in batch ---
             auto tp0 = std::chrono::system_clock::now();
-            model.postprocess(objects, cur_slot);
+            for (int b = 0; b < actual_batch; b++) {
+                vector<Detection> objects;
+                model.postprocess(objects, slot, b);
+
+                if (save_output) {
+                    model.draw(images[b], objects);
+                    video_writer.write(images[b]);
+                }
+            }
             auto tp1 = std::chrono::system_clock::now();
             total_post_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(tp1 - tp0).count() / 1000.;
 
-            // Draw and save current frame
-            if (save_output) {
-                model.draw(images[cur_slot], objects);
-                video_writer.write(images[cur_slot]);
-            }
-
-            frame_count++;
-            cur_slot = nxt_slot;
-        }
-
-        // Finish the last frame (still on cur_slot)
-        {
-            vector<Detection> objects;
-            auto tp0 = std::chrono::system_clock::now();
-            model.postprocess(objects, cur_slot);
-            auto tp1 = std::chrono::system_clock::now();
-            total_post_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(tp1 - tp0).count() / 1000.;
-
-            if (save_output) {
-                model.draw(images[cur_slot], objects);
-                video_writer.write(images[cur_slot]);
-            }
-            frame_count++;
+            frame_count += actual_batch;
         }
 
         // Release resources
@@ -215,11 +186,12 @@ int main(int argc, char** argv)
             printf("Output saved to: %s\n", output_path.c_str());
         }
 
-        printf("--- Per-frame average (%d frames) ---\n", frame_count);
-        printf("  preprocess:  %.2f ms\n", total_pre_ms / frame_count);
-        printf("  inference:   %.2f ms\n", total_inf_ms / frame_count);
-        printf("  postprocess: %.2f ms\n", total_post_ms / frame_count);
-        printf("  total:       %.2f ms  (%.1f FPS)\n",
+        printf("--- Batched inference (batch=%d, %d frames) ---\n", B, frame_count);
+        printf("  preprocess:  %.2f ms/frame\n", total_pre_ms / frame_count);
+        printf("  inference:   %.2f ms/batch  (%.2f ms/frame)\n",
+               total_inf_ms / (frame_count / B), total_inf_ms / frame_count);
+        printf("  postprocess: %.2f ms/frame\n", total_post_ms / frame_count);
+        printf("  total:       %.2f ms/frame  (%.1f FPS)\n",
                (total_pre_ms + total_inf_ms + total_post_ms) / frame_count,
                1000.0 * frame_count / (total_pre_ms + total_inf_ms + total_post_ms));
     }
