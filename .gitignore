@@ -1,0 +1,6 @@
+build
+.cache
+runs
+*.mp4
+model
+.vscode

@@ -14,27 +14,28 @@ include_directories(src/)
 # Add source files
 set(SOURCES
     main.cpp
-    src/yolov11.cpp
+    src/YOLOv11.cpp
 )
 
 # Add CUDA source files
-set(CUDA_SOURCES src/preprocess.cu)
+set(CUDA_SOURCES src/preprocess.cu src/postprocess.cu)
 
 # Add headers
 set(HEADERS
-    src/yolov11.h
+    src/YOLOv11.h
     src/macros.h
     src/logging.h
     src/cuda_utils.h
     src/preprocess.h
+    src/postprocess.h
     src/common.h
 )
 
 # Find and include OpenCV
-set(OpenCV_DIR "your OpenCV build directory path")
+set(OpenCV_DIR "/usr/lib/x86_64-linux-gnu/cmake/opencv4")
 
 # Set TensorRT path if not set in environment variables
-set(TENSORRT_DIR "your tensorrt path")
+set(TENSORRT_DIR "/usr/local/TensorRT-10.14.1.48")
 
 # Include OpenCV
 find_package(OpenCV REQUIRED)
@@ -43,7 +44,7 @@ include_directories(${OpenCV_INCLUDE_DIRS})
 # Include TensorRT
 include_directories(${TENSORRT_DIR}/include)
 link_directories(${TENSORRT_DIR}/lib)
-set(TENSORRT_LIBS nvinfer nvinfer_plugin nvparsers nvonnxparser)
+set(TENSORRT_LIBS nvinfer nvinfer_plugin nvonnxparser)
 
 # Create an executable
 cuda_add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS} ${CUDA_SOURCES})

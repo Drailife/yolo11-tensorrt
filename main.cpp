@@ -1,4 +1,5 @@
-﻿#ifdef _WIN32
+﻿#include <cstdio>
+#ifdef _WIN32
 #include <windows.h>
 #else
 #include <sys/stat.h>
@@ -7,7 +8,7 @@
 
 #include <iostream>
 #include <string>
-#include "yolov11.h"
+#include "YOLOv11.h"
 
 
 bool IsPathExist(const string& path) {
@@ -46,11 +47,46 @@ class Logger : public nvinfer1::ILogger {
 
 int main(int argc, char** argv)
 {
+    // Usage check
+    if (argc < 2 || argc > 4) {
+        printf("Usage:\n");
+        printf("  Build engine:    %s <model.onnx>\n", argv[0]);
+        printf("  Build && infer:  %s <model.onnx> <video_or_image>\n", argv[0]);
+        printf("  Run inference:   %s <model.engine> <video_or_image> [output.mp4]\n", argv[0]);
+        return 1;
+    }
+
+    // 统计最最开始的时间
+    auto program_start_time = std::chrono::system_clock::now();
     const string engine_file_path{ argv[1] };
+
+    // Optional output video path (3rd argument)
+    string output_path;
+    bool save_output = (argc >= 4);
+    if (save_output) {
+        output_path = argv[3];
+    }
+
+    // ---- Mode 1: Build engine only (1 argument, .onnx file) ----
+    bool is_onnx = engine_file_path.find(".onnx") != std::string::npos;
+    if (argc == 2) {
+        if (!is_onnx) {
+            printf("Error: single argument must be an .onnx file to build engine.\n");
+            return 1;
+        }
+        printf("Building TensorRT engine from %s ...\n", engine_file_path.c_str());
+        YOLOv11 model(engine_file_path, logger);
+        printf("Engine built successfully.\n");
+        printf("Program runtime: %.0f ms\n",
+            (double)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now() - program_start_time).count());
+        return 0;
+    }
+
+    // ---- Mode 2: Inference (2 arguments) ----
     const string path{ argv[2] };
     vector<string> imagePathList;
-    bool                     isVideo{ false };
-    assert(argc == 3);
+    bool isVideo{ false };
 
     if (IsFile(path))
     {
@@ -81,6 +117,25 @@ int main(int argc, char** argv)
         //path to video
         cv::VideoCapture cap(path);
 
+        // Setup video writer if saving output
+        cv::VideoWriter video_writer;
+        if (save_output) {
+            int codec = cv::VideoWriter::fourcc('a', 'v', 'c', '1');  // H.264
+            double out_fps = cap.get(cv::CAP_PROP_FPS);
+            int out_w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+            int out_h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+            video_writer.open(output_path, codec, out_fps, cv::Size(out_w, out_h));
+            if (!video_writer.isOpened()) {
+                printf("Error: Cannot open output video: %s\n", output_path.c_str());
+                return 1;
+            }
+            printf("Saving output to: %s  (%dx%d @ %.1f FPS)\n",
+                   output_path.c_str(), out_w, out_h, out_fps);
+        }
+
+        double total_pre_ms = 0, total_inf_ms = 0, total_post_ms = 0;
+        int frame_count = 0;
+
         while (1)
         {
             Mat image;
@@ -89,57 +144,64 @@ int main(int argc, char** argv)
             if (image.empty()) break;
 
             vector<Detection> objects;
+
+            auto t0 = std::chrono::system_clock::now();
             model.preprocess(image);
-
-            auto start = std::chrono::system_clock::now();
+            auto t1 = std::chrono::system_clock::now();
             model.infer();
-            auto end = std::chrono::system_clock::now();
-
+            auto t2 = std::chrono::system_clock::now();
             model.postprocess(objects);
-            model.draw(image, objects);
+            auto t3 = std::chrono::system_clock::now();
+            // 打印objects
+            // for (const auto& obj : objects) {
+            //     printf("class_id: %d, conf: %.2f, bbox: [%d, %d, %d, %d]\n",
+            //         obj.class_id, obj.conf,
+            //         obj.bbox.x, obj.bbox.y,
+            //         obj.bbox.width, obj.bbox.height);
+            // }
 
-            auto tc = (double)std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.;
-            printf("cost %2.4lf ms\n", tc);
+            // Save frame if output is enabled
+            if (save_output) {
+                model.draw(image, objects);
+                video_writer.write(image);
+            }
 
-            imshow("prediction", image);
-            waitKey(1);
+            auto pre_ms  = (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.;
+            auto inf_ms  = (double)std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.;
+            auto post_ms = (double)std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count() / 1000.;
+            total_pre_ms += pre_ms;
+            total_inf_ms += inf_ms;
+            total_post_ms += post_ms;
+            frame_count++;
+            // 保存图片
+            // imwrite("output.jpg", image);
+            // imshow("prediction", image);
+            // waitKey(1);
         }
 
         // Release resources
-        destroyAllWindows();
+        // destroyAllWindows();
         cap.release();
-    }
-    else {
-        // path to folder saves images
-        for (const auto& imagePath : imagePathList)
-        {
-            // open image
-            Mat image = imread(imagePath);
-            if (image.empty())
-            {
-                cerr << "Error reading image: " << imagePath << endl;
-                continue;
-            }
-
-            vector<Detection> objects;
-            model.preprocess(image);
-
-            auto start = std::chrono::system_clock::now();
-            model.infer();
-            auto end = std::chrono::system_clock::now();
-
-            model.postprocess(objects);
-            model.draw(image, objects);
-
-            auto tc = (double)std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.;
-            printf("cost %2.4lf ms\n", tc);
-
-            model.draw(image, objects);
-            imshow("Result", image);
-
-            waitKey(0);
+        if (save_output) {
+            video_writer.release();
+            printf("Output saved to: %s\n", output_path.c_str());
         }
+
+        printf("--- Per-frame average (%d frames) ---\n", frame_count);
+        printf("  preprocess:  %.2f ms\n", total_pre_ms / frame_count);
+        printf("  inference:   %.2f ms\n", total_inf_ms / frame_count);
+        printf("  postprocess: %.2f ms\n", total_post_ms / frame_count);
+        printf("  total:       %.2f ms  (%.1f FPS)\n",
+               (total_pre_ms + total_inf_ms + total_post_ms) / frame_count,
+               1000.0 * frame_count / (total_pre_ms + total_inf_ms + total_post_ms));
+    }
+    else{
+        printf("not video\n");
+        return 0;
     }
 
+    auto program_end_time = std::chrono::system_clock::now();
+    auto program_duration = std::chrono::duration_cast<std::chrono::milliseconds>(program_end_time - program_start_time).count();
+    printf("Program runtime: %ld ms\n", program_duration);
     return 0;
 }

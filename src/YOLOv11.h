@@ -30,13 +30,16 @@ public:
 private:
     void init(std::string engine_path, nvinfer1::ILogger& logger);
 
-    float* gpu_buffers[2];               //!< The vector of device buffers needed for engine execution
-    float* cpu_output_buffer;
+    float* gpu_buffers[2] = {nullptr, nullptr};  //!< Device buffers for engine execution
+    float* gpu_filtered_boxes = nullptr;          //!< GPU buffer for filtered detections
+    int*   gpu_filtered_count = nullptr;          //!< GPU atomic counter for valid detections
+    float* cpu_filtered_boxes = nullptr;          //!< CPU buffer for copying filtered results
+    bool   inference_initialized = false;         //!< Whether init() has been called
 
-    cudaStream_t stream;
-    IRuntime* runtime;                 //!< The TensorRT runtime used to deserialize the engine
-    ICudaEngine* engine;               //!< The TensorRT engine used to run the network
-    IExecutionContext* context;        //!< The context for executing inference using an ICudaEngine
+    cudaStream_t stream = nullptr;
+    IRuntime* runtime = nullptr;
+    ICudaEngine* engine = nullptr;
+    IExecutionContext* context = nullptr;
 
     // Model parameters
     int input_w;
@@ -45,6 +48,7 @@ private:
     int detection_attribute_size;
     int num_classes = 80;
     const int MAX_IMAGE_SIZE = 4096 * 4096;
+    const int MAX_OUTPUT_DETECTIONS = 1000;
     float conf_threshold = 0.3f;
     float nms_threshold = 0.4f;
 
