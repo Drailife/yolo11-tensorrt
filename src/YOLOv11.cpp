@@ -3,7 +3,6 @@
 #include "cuda_utils.h"
 #include "macros.h"
 #include "preprocess.h"
-#include "postprocess.h"
 #include <NvOnnxParser.h>
 #include "common.h"
 #include <fstream>
@@ -69,29 +68,21 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
     input_h = input_dims.d[2];
     input_w = input_dims.d[3];
     auto output_dims = engine->getTensorShape(engine->getIOTensorName(1));
-    detection_attribute_size = output_dims.d[1];
-    num_detections = output_dims.d[2];
+    detection_attribute_size = output_dims.d[2];  // 6 with NMS export
+    num_detections = output_dims.d[1];            // 300 with NMS export
 #endif
-    num_classes = detection_attribute_size - 4;
 
-    // Initialize input buffers
+    // Initialize input buffer
     CUDA_CHECK(cudaMalloc(&gpu_buffers[0], 3 * input_w * input_h * sizeof(float)));
-    // Initialize output buffer
-    CUDA_CHECK(cudaMalloc(&gpu_buffers[1], detection_attribute_size * num_detections * sizeof(float)));
+    // Initialize output buffer ([300, 6] = num_detections * detection_attribute_size)
+    CUDA_CHECK(cudaMalloc(&gpu_buffers[1], num_detections * detection_attribute_size * sizeof(float)));
 
 #if NV_TENSORRT_MAJOR >= 10
-    // For TensorRT 10.x, set tensor addresses before enqueueV3
     context->setInputTensorAddress(engine->getIOTensorName(0), gpu_buffers[0]);
     context->setOutputTensorAddress(engine->getIOTensorName(1), gpu_buffers[1]);
 #endif
 
-    // Allocate GPU postprocess buffers
-    CUDA_CHECK(cudaMalloc(&gpu_filtered_boxes, MAX_OUTPUT_DETECTIONS * 6 * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&gpu_filtered_count, sizeof(int)));
-    cpu_filtered_boxes = new float[MAX_OUTPUT_DETECTIONS * 6];
-
     cuda_preprocess_init(MAX_IMAGE_SIZE);
-
     CUDA_CHECK(cudaStreamCreate(&stream));
 
 
@@ -113,9 +104,6 @@ YOLOv11::~YOLOv11()
         CUDA_CHECK(cudaStreamDestroy(stream));
         for (int i = 0; i < 2; i++)
             CUDA_CHECK(cudaFree(gpu_buffers[i]));
-        CUDA_CHECK(cudaFree(gpu_filtered_boxes));
-        CUDA_CHECK(cudaFree(gpu_filtered_count));
-        delete[] cpu_filtered_boxes;
         cuda_preprocess_destroy();
     }
 
@@ -142,77 +130,41 @@ void YOLOv11::infer()
 
 void YOLOv11::postprocess(vector<Detection>& output)
 {
-    // ----- Step 1: Zero the atomic counter on GPU -----
-    CUDA_CHECK(cudaMemsetAsync(gpu_filtered_count, 0, sizeof(int), stream));
+    // Allocate CPU buffer for output [num_detections * detection_attribute_size]
+    int output_size = num_detections * detection_attribute_size;
+    float* cpu_output = new float[output_size];
 
-    // ----- Step 2: GPU kernel: decode boxes + filter by confidence -----
-    cuda_postprocess_decode(
-        gpu_buffers[1],          // raw model output on GPU
-        gpu_filtered_boxes,      // filtered output on GPU
-        gpu_filtered_count,      // atomic counter
-        num_detections,
-        num_classes,
-        detection_attribute_size,
-        conf_threshold,
-        MAX_OUTPUT_DETECTIONS,
-        stream
-    );
-
-    // ----- Step 3: Copy filtered count back to CPU -----
-    int filtered_count = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&filtered_count, gpu_filtered_count, sizeof(int),
+    // Copy from GPU to CPU
+    CUDA_CHECK(cudaMemcpyAsync(cpu_output, gpu_buffers[1],
+                               output_size * sizeof(float),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    if (filtered_count == 0) return;
-    if (filtered_count > MAX_OUTPUT_DETECTIONS) filtered_count = MAX_OUTPUT_DETECTIONS;
+    // Parse NMS output: [num_detections, 6]  where 6 = [x1, y1, x2, y2, conf, class]
+    for (int i = 0; i < num_detections; i++) {
+        float x1   = cpu_output[i * 6 + 0];
+        float y1   = cpu_output[i * 6 + 1];
+        float x2   = cpu_output[i * 6 + 2];
+        float y2   = cpu_output[i * 6 + 3];
+        float conf = cpu_output[i * 6 + 4];
+        int   cls  = (int)cpu_output[i * 6 + 5];
 
-    // ----- Step 4: Copy only the filtered detections to CPU -----
-    CUDA_CHECK(cudaMemcpyAsync(cpu_filtered_boxes, gpu_filtered_boxes,
-                               filtered_count * 6 * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Skip invalid/padded entries
+        if (conf <= 0.0f) continue;
+        if (x1 == 0.0f && y1 == 0.0f && x2 == 0.0f && y2 == 0.0f) continue;
 
-    // ----- Step 5: Build detection lists for NMS (now very few boxes) -----
-    vector<Rect> boxes;
-    vector<int> class_ids;
-    vector<float> confidences;
-    boxes.reserve(filtered_count);
-    class_ids.reserve(filtered_count);
-    confidences.reserve(filtered_count);
-
-    for (int i = 0; i < filtered_count; i++) {
-        float x    = cpu_filtered_boxes[i * 6 + 0];
-        float y    = cpu_filtered_boxes[i * 6 + 1];
-        float w    = cpu_filtered_boxes[i * 6 + 2];
-        float h    = cpu_filtered_boxes[i * 6 + 3];
-        float conf = cpu_filtered_boxes[i * 6 + 4];
-        int   cls  = (int)cpu_filtered_boxes[i * 6 + 5];
-
-        Rect box;
-        box.x = static_cast<int>(x);
-        box.y = static_cast<int>(y);
-        box.width = static_cast<int>(w);
-        box.height = static_cast<int>(h);
-
-        boxes.push_back(box);
-        class_ids.push_back(cls);
-        confidences.push_back(conf);
+        Detection det;
+        det.conf = conf;
+        det.class_id = cls;
+        // Convert xyxy to xywh (draw() expects xywh in model-input space)
+        det.bbox = Rect(static_cast<int>(x1),
+                        static_cast<int>(y1),
+                        static_cast<int>(x2 - x1),
+                        static_cast<int>(y2 - y1));
+        output.push_back(det);
     }
 
-    // ----- Step 6: CPU NMS on the small filtered set -----
-    vector<int> nms_result;
-    dnn::NMSBoxes(boxes, confidences, conf_threshold, nms_threshold, nms_result);
-
-    for (int i = 0; i < nms_result.size(); i++)
-    {
-        Detection result;
-        int idx = nms_result[i];
-        result.class_id = class_ids[idx];
-        result.conf = confidences[idx];
-        result.bbox = boxes[idx];
-        output.push_back(result);
-    }
+    delete[] cpu_output;
 }
 
 void YOLOv11::build(std::string onnxPath, nvinfer1::ILogger& logger)

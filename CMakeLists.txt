@@ -18,7 +18,7 @@ set(SOURCES
 )
 
 # Add CUDA source files
-set(CUDA_SOURCES src/preprocess.cu src/postprocess.cu)
+set(CUDA_SOURCES src/preprocess.cu)
 
 # Add headers
 set(HEADERS
@@ -27,7 +27,6 @@ set(HEADERS
     src/logging.h
     src/cuda_utils.h
     src/preprocess.h
-    src/postprocess.h
     src/common.h
 )
 
