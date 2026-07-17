@@ -8,7 +8,71 @@
 
 #include <iostream>
 #include <string>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
 #include "YOLOv11.h"
+
+
+/**
+ * @brief Thread-safe frame queue with back-pressure.
+ *
+ * Producer thread reads frames from video and pushes them into the queue.
+ * Consumer (main thread) pops frames for inference.
+ * This decouples I/O from GPU computation: while GPU is busy, the producer
+ * pre-reads frames so the GPU never waits for disk or video decoding.
+ */
+class FrameQueue {
+public:
+    explicit FrameQueue(size_t max_size = 64) : max_size_(max_size) {}
+
+    /**
+     * @brief Push a frame into the queue (called by producer thread).
+     *        Blocks if the queue is full (back-pressure to prevent memory blowup).
+     */
+    void push(cv::Mat frame) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        // Wait until there's room in the queue
+        cv_not_full_.wait(lock, [this] { return q_.size() < max_size_ || done_; });
+        if (done_) return;  // Shouldn't happen, but safety
+        q_.push(std::move(frame));
+        cv_not_empty_.notify_one();  // Wake up consumer
+    }
+
+    /**
+     * @brief Pop a frame from the queue (called by consumer/main thread).
+     * @return true if a frame was popped, false if producer is done and queue is empty.
+     */
+    bool pop(cv::Mat& frame) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        // Wait until there's a frame available OR producer is done
+        cv_not_empty_.wait(lock, [this] { return !q_.empty() || (done_ && q_.empty()); });
+        if (q_.empty() && done_) return false;  // All frames consumed
+        frame = std::move(q_.front());
+        q_.pop();
+        cv_not_full_.notify_one();  // Wake up producer (room available)
+        return true;
+    }
+
+    /**
+     * @brief Signal that no more frames will be pushed.
+     *        Wakes up consumer so it can drain remaining frames and exit.
+     */
+    void setDone() {
+        std::unique_lock<std::mutex> lock(mtx_);
+        done_ = true;
+        cv_not_empty_.notify_all();
+    }
+
+private:
+    std::queue<cv::Mat> q_;
+    std::mutex mtx_;
+    std::condition_variable cv_not_empty_;  // Consumer waits on this
+    std::condition_variable cv_not_full_;   // Producer waits on this (back-pressure)
+    size_t max_size_;
+    bool done_ = false;
+};
 
 
 bool IsPathExist(const string& path) {
@@ -115,11 +179,17 @@ int main(int argc, char** argv)
 
     if (isVideo) {
         cv::VideoCapture cap(path);
+        if (!cap.isOpened()) {
+            printf("Error: Cannot open video: %s\n", path.c_str());
+            return 1;
+        }
+        int total_frames = (int)cap.get(cv::CAP_PROP_FRAME_COUNT);
+        printf("Video: %d frames\n", total_frames);
 
         // Setup video writer if saving output
         cv::VideoWriter video_writer;
         if (save_output) {
-            int codec = cv::VideoWriter::fourcc('a', 'v', 'c', '1');
+            int codec = cv::VideoWriter::fourcc('a', 'v', 'c', '1');  // H.264
             double out_fps = cap.get(cv::CAP_PROP_FPS);
             int out_w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
             int out_h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
@@ -132,7 +202,22 @@ int main(int argc, char** argv)
                    output_path.c_str(), out_w, out_h, out_fps);
         }
 
-        // ---- Dual-stream + batched inference ----
+        // ================================================================
+        //  Async frame decoding: producer thread reads frames ahead of time
+        //  so the GPU pipeline never waits for disk I/O or video decode.
+        // ================================================================
+        FrameQueue frame_queue(128);  // Buffer up to 128 frames (~2GB for 1920x1920)
+
+        // Producer thread: continuously read frames from video
+        std::thread producer([&]() {
+            cv::Mat frame;
+            while (cap.read(frame)) {
+                frame_queue.push(std::move(frame));
+            }
+            frame_queue.setDone();  // Signal consumer: no more frames
+        });
+
+        // ---- Dual-stream + batched inference (consumer = main thread) ----
         double total_pre_ms = 0, total_inf_ms = 0, total_post_ms = 0;
         int frame_count = 0;
         const int B = model.getBatchSize();
@@ -143,12 +228,12 @@ int main(int argc, char** argv)
         int cur_slot = 0;
         int cur_actual = 0;
         for (int b = 0; b < B; b++) {
-            if (!cap.read(images_buf[cur_slot][b])) break;
+            if (!frame_queue.pop(images_buf[cur_slot][b])) break;
             cur_actual++;
         }
-        if (cur_actual == 0) { cap.release(); return 0; }
+        if (cur_actual == 0) { cap.release(); producer.join(); return 0; }
 
-        // Preprocess + infer batch 0 on slot 0 (async — no host wait)
+        // Preprocess + infer batch 0 on slot 0 (async — no host sync)
         auto t0 = std::chrono::system_clock::now();
         for (int b = 0; b < cur_actual; b++)
             model.preprocess(images_buf[cur_slot][b], cur_slot, b);
@@ -162,15 +247,16 @@ int main(int argc, char** argv)
         while (true) {
             int nxt_slot = 1 - cur_slot;
 
-            // Read next batch
+            // Pop next batch of frames from the pre-filled queue (non-blocking if buffered)
             int nxt_actual = 0;
             for (int b = 0; b < B; b++) {
-                if (!cap.read(images_buf[nxt_slot][b])) break;
+                if (!frame_queue.pop(images_buf[nxt_slot][b])) break;
                 nxt_actual++;
             }
-            if (nxt_actual == 0) break;  // no more frames
+            if (nxt_actual == 0) break;  // No more frames
 
             // Launch GPU work for next batch (async on other stream)
+            // GPU starts working while CPU finishes current batch's postprocess
             auto pp0 = std::chrono::system_clock::now();
             for (int b = 0; b < nxt_actual; b++)
                 model.preprocess(images_buf[nxt_slot][b], nxt_slot, b);
@@ -214,14 +300,15 @@ int main(int argc, char** argv)
             frame_count += cur_actual;
         }
 
-        // Release resources
+        // Cleanup: wait for producer to finish, release resources
+        producer.join();
         cap.release();
         if (save_output) {
             video_writer.release();
             printf("Output saved to: %s\n", output_path.c_str());
         }
 
-        printf("--- Dual-stream + Batch%d (%d frames) ---\n", B, frame_count);
+        printf("--- Dual-stream + Batch%d + AsyncDecode (%d frames) ---\n", B, frame_count);
         printf("  preprocess:  %.2f ms/frame\n", total_pre_ms / frame_count);
         printf("  inference:   %.2f ms/batch  (%.2f ms/frame)\n",
                total_inf_ms / (frame_count / B), total_inf_ms / frame_count);
