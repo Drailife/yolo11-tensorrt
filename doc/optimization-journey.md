@@ -461,6 +461,12 @@ cv::VideoCapture:  589 fps  ← 解码 + BGR转换 + cv::Mat构造 + 内存拷�
 ```
 
 若改用 NVDEC + FFmpeg 管道，解码耗时 0.74ms → ~0.01ms，预计真实吞吐可从 589 fps → **900+ fps**。
+
+> **实测 FFmpeg NVDEC 管道 (2025-07-18)**: 尝试了 `ffmpeg -hwaccel cuda -i video.mp4 -f rawvideo -pix_fmt bgr24 -` 管道方案。结果反而更慢 (291 vs 589 FPS)。
+>
+> 原因：NVDEC 解码在 GPU 上输出 NV12 格式，FFmpeg 的 `-pix_fmt bgr24` 触发 CPU 端 swscale 色彩转换（NV12→BGR24），加上管道 stdout/fread 的内存拷贝开销，总耗时反而比 `cv::VideoCapture` 的零拷贝内存映射更慢。
+>
+> **可行方案**: 需绕过 CPU 色彩转换——要么在 GPU 端完成 NV12→BGR（CUDA kernel），要么直接编译 OpenCV with CUDA/NVCUVID 支持，由 `cv::cudacodec::VideoReader` 硬件解码。
 ---
 
 ## 8. Batch 大小的甜点分析
