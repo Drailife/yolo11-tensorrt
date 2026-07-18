@@ -13,6 +13,8 @@
 #include <condition_variable>
 #include <queue>
 #include "YOLOv11.h"
+#include <opencv2/cudacodec.hpp>
+#include <cuda_runtime.h>
 
 
 /**
@@ -178,43 +180,49 @@ int main(int argc, char** argv)
     YOLOv11 model(engine_file_path, logger);
 
     if (isVideo) {
-        cv::VideoCapture cap(path);
-        if (!cap.isOpened()) {
-            printf("Error: Cannot open video: %s\n", path.c_str());
-            return 1;
-        }
-        int total_frames = (int)cap.get(cv::CAP_PROP_FRAME_COUNT);
-        printf("Video: %d frames\n", total_frames);
+        // ============================================================
+        //  Dual-GPU NVDEC pipeline:
+        //    GPU 0 (device 0): TensorRT inference (main thread)
+        //    GPU 1 (device 1): NVDEC hardware video decode (producer thread)
+        //  Frames decoded on GPU 1, downloaded to CPU, then fed to GPU 0
+        // ============================================================
+
+        // --- Get video metadata ---
+        cv::VideoCapture cap_meta(path);
+        double vid_fps = cap_meta.get(cv::CAP_PROP_FPS);
+        int vid_w = (int)cap_meta.get(cv::CAP_PROP_FRAME_WIDTH);
+        int vid_h = (int)cap_meta.get(cv::CAP_PROP_FRAME_HEIGHT);
+        int total_frames = (int)cap_meta.get(cv::CAP_PROP_FRAME_COUNT);
+        cap_meta.release();
+        printf("Video: %d frames, %dx%d @ %.1f FPS (NVDEC on GPU 1)\n",
+               total_frames, vid_w, vid_h, vid_fps);
 
         // Setup video writer if saving output
         cv::VideoWriter video_writer;
         if (save_output) {
-            int codec = cv::VideoWriter::fourcc('a', 'v', 'c', '1');  // H.264
-            double out_fps = cap.get(cv::CAP_PROP_FPS);
-            int out_w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
-            int out_h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-            video_writer.open(output_path, codec, out_fps, cv::Size(out_w, out_h));
+            int codec = cv::VideoWriter::fourcc('a', 'v', 'c', '1');
+            video_writer.open(output_path, codec, vid_fps, cv::Size(vid_w, vid_h));
             if (!video_writer.isOpened()) {
                 printf("Error: Cannot open output video: %s\n", output_path.c_str());
                 return 1;
             }
             printf("Saving output to: %s  (%dx%d @ %.1f FPS)\n",
-                   output_path.c_str(), out_w, out_h, out_fps);
+                   output_path.c_str(), vid_w, vid_h, vid_fps);
         }
 
-        // ================================================================
-        //  Async frame decoding: producer thread reads frames ahead of time
-        //  so the GPU pipeline never waits for disk I/O or video decode.
-        // ================================================================
-        FrameQueue frame_queue(128);  // Buffer up to 128 frames (~2GB for 1920x1920)
+        FrameQueue frame_queue(128);
 
-        // Producer thread: continuously read frames from video
+        // Producer thread: NVDEC hardware decode on GPU 1 (separate from TensorRT on GPU 0)
         std::thread producer([&]() {
-            cv::Mat frame;
-            while (cap.read(frame)) {
-                frame_queue.push(std::move(frame));
+            cudaSetDevice(1);  // Use GPU 1 for NVDEC (avoids CUDA context conflict)
+            auto reader = cv::cudacodec::createVideoReader(path);
+            cv::cuda::GpuMat gpu_frame;
+            while (reader->nextFrame(gpu_frame)) {
+                cv::Mat cpu_frame;
+                gpu_frame.download(cpu_frame);  // GPU 1 → CPU RAM (DMA over PCIe)
+                frame_queue.push(std::move(cpu_frame));
             }
-            frame_queue.setDone();  // Signal consumer: no more frames
+            frame_queue.setDone();
         });
 
         // ---- Dual-stream + batched inference (consumer = main thread) ----
@@ -234,7 +242,7 @@ int main(int argc, char** argv)
             if (!frame_queue.pop(images_buf[cur_slot][b])) break;
             cur_actual++;
         }
-        if (cur_actual == 0) { cap.release(); producer.join(); return 0; }
+        if (cur_actual == 0) { producer.join(); return 0; }
 
         // Preprocess + infer batch 0 on slot 0 (async — no host sync)
         auto t0 = std::chrono::system_clock::now();
@@ -303,15 +311,14 @@ int main(int argc, char** argv)
             frame_count += cur_actual;
         }
 
-        // Cleanup: wait for producer to finish, release resources
+        // Cleanup
         producer.join();
-        cap.release();
         if (save_output) {
             video_writer.release();
             printf("Output saved to: %s\n", output_path.c_str());
         }
 
-        printf("--- Dual-stream + Batch%d + AsyncDecode (%d frames) ---\n", B, frame_count);
+        printf("--- Dual-stream + Batch%d + DualGPU-NVDEC (%d frames) ---\n", B, frame_count);
         printf("  preprocess:  %.2f ms/frame\n", total_pre_ms / frame_count);
         printf("  inference:   %.2f ms/batch  (%.2f ms/frame)\n",
                total_inf_ms / (frame_count / B), total_inf_ms / frame_count);

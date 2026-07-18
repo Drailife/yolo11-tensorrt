@@ -478,6 +478,16 @@ cv::VideoCapture:  589 fps  ← 解码 + BGR转换 + cv::Mat构造 + 内存拷�
 >
 > **结论**: 纯 H.264 解码 NVDEC 确实快（1836 fps），但和 TensorRT 跑同一 GPU 时互相干扰。当前最优方案仍是 **CPU 软解 + 异步队列**（589 FPS）。除非把解码和推理拆分到不同 GPU，否则 CPU 解码就是瓶颈最低的选择。
 
+> **实测双 GPU NVDEC (2025-07-18)**: 使用 `CUDA_VISIBLE_DEVICES=1,2`，TensorRT 在 GPU 0，NVDEC 在 GPU 1（`cudaSetDevice(1)`），彻底消除 CUDA context 冲突。
+>
+> | 方案 | Pre | Infer/批 | Post | Pipeline FPS | **Real FPS** | 总耗时 |
+> |------|------|------|------|------|------|------|
+> | CPU 软解 | 0.68 | 0.74 | 0.10 | 1040 | 589 | 30.5s |
+> | 单 GPU NVDEC | 1.03 | 2.18 | 0.65 | 451 | 448 | 38.1s |
+> | **双 GPU NVDEC** 🏆 | **0.65** | **0.59** | **0.10** | **1120** | **759** | **21.7s** |
+>
+> 双 GPU 方案不仅消除冲突，TensorRT 推理甚至比 CPU 解码版更快（0.59 vs 0.74ms/批），因为 NVDEC 完全不影响 TensorRT 的 GPU 资源。最终 **759 FPS，vs Python 的 10× 加速，vs CPU 软解的 1.29× 加速**。
+
 ---
 
 ## 8. Batch 大小的甜点分析

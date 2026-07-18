@@ -31,8 +31,8 @@ set(HEADERS
     src/common.h
 )
 
-# Find and include OpenCV
-set(OpenCV_DIR "/usr/lib/x86_64-linux-gnu/cmake/opencv4")
+# Find and include OpenCV (self-compiled with CUDA + NVCUVID for cudacodec)
+set(OpenCV_DIR "/home/xiaodai/opencv_cuda/opencv-4.10.0/build")
 
 # Set TensorRT path if not set in environment variables
 set(TENSORRT_DIR "/usr/local/TensorRT-10.14.1.48")
