@@ -61,8 +61,15 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
     input_h = input_dims.d[2];
     input_w = input_dims.d[3];
     auto output_dims = engine->getTensorShape(engine->getIOTensorName(1));
-    detection_attribute_size = output_dims.d[1];
-    num_detections = output_dims.d[2];
+    // NMS models output [batch, num_dets, det_attr]; non-NMS output [batch, det_attr, num_dets]
+    // Heuristic: if d[2] <= 6, it's NMS format — swap d[1] and d[2]
+    if (output_dims.d[2] <= 6) {
+        num_detections = output_dims.d[1];
+        detection_attribute_size = output_dims.d[2];
+    } else {
+        detection_attribute_size = output_dims.d[1];
+        num_detections = output_dims.d[2];
+    }
 #endif
     num_classes = detection_attribute_size - 4;
     // Auto-detect NMS model: if det_attr <= 6, NMS is built into the engine
