@@ -60,6 +60,7 @@ private:
     int batch_size = 1;           // Read from engine; 4 for batch export
     int num_detections = 0;       // 8400 or 300
     int detection_attribute_size = 0; // 84 or 6
+    bool has_nms = false;        // true if engine has built-in NMS (det_attr <= 6)
     int num_classes = 80;
     const int MAX_IMAGE_SIZE = 4096 * 4096;
     const int MAX_OUTPUT_DETECTIONS = 1000;

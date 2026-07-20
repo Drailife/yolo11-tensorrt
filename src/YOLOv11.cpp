@@ -65,8 +65,11 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
     num_detections = output_dims.d[2];
 #endif
     num_classes = detection_attribute_size - 4;
-    printf("Model: batch=%d, input=%dx%d, det_attr=%d, num_dets=%d, classes=%d\n",
-           batch_size, input_w, input_h, detection_attribute_size, num_detections, num_classes);
+    // Auto-detect NMS model: if det_attr <= 6, NMS is built into the engine
+    has_nms = (detection_attribute_size <= 6);
+    printf("Model: batch=%d, input=%dx%d, det_attr=%d, num_dets=%d, classes=%d, NMS=%s\n",
+           batch_size, input_w, input_h, detection_attribute_size, num_detections, num_classes,
+           has_nms ? "built-in" : "CPU");
 
     // ---- Per-slot initialization (2 slots for pipelining) ----
     for (int s = 0; s < NUM_STREAMS; s++) {
@@ -82,10 +85,12 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
         contexts[s]->setOutputTensorAddress(engine->getIOTensorName(1), gpu_buffers[s][1]);
 #endif
 
-        // Postprocess GPU buffers
-        CUDA_CHECK(cudaMalloc(&gpu_filtered_boxes[s], MAX_OUTPUT_DETECTIONS * 6 * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&gpu_filtered_count[s], sizeof(int)));
-        cpu_filtered_boxes[s] = new float[MAX_OUTPUT_DETECTIONS * 6];
+        // Postprocess GPU buffers (only needed for non-NMS models)
+        if (!has_nms) {
+            CUDA_CHECK(cudaMalloc(&gpu_filtered_boxes[s], MAX_OUTPUT_DETECTIONS * 6 * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&gpu_filtered_count[s], sizeof(int)));
+            cpu_filtered_boxes[s] = new float[MAX_OUTPUT_DETECTIONS * 6];
+        }
 
         // Stream + event per slot
         CUDA_CHECK(cudaStreamCreate(&streams[s]));
@@ -114,9 +119,11 @@ YOLOv11::~YOLOv11()
             CUDA_CHECK(cudaEventDestroy(events[s]));
             CUDA_CHECK(cudaFree(gpu_buffers[s][0]));
             CUDA_CHECK(cudaFree(gpu_buffers[s][1]));
-            CUDA_CHECK(cudaFree(gpu_filtered_boxes[s]));
-            CUDA_CHECK(cudaFree(gpu_filtered_count[s]));
-            delete[] cpu_filtered_boxes[s];
+            if (!has_nms) {
+                CUDA_CHECK(cudaFree(gpu_filtered_boxes[s]));
+                CUDA_CHECK(cudaFree(gpu_filtered_count[s]));
+                delete[] cpu_filtered_boxes[s];
+            }
             delete contexts[s];
         }
         cuda_preprocess_destroy();
@@ -149,7 +156,33 @@ void YOLOv11::postprocess(vector<Detection>& output, int slot, int batch_idx)
     int per_image_size = detection_attribute_size * num_detections;
     float* raw_output = gpu_buffers[slot][1] + batch_idx * per_image_size;
 
-    // ----- Step 1: Zero atomic counter on GPU (async on stream[slot]) -----
+    if (has_nms) {
+        // ---- NMS mode: engine already outputs [num_dets, 6] NMS'd results ----
+        int output_size = num_detections * detection_attribute_size;  // 300 * 6
+        float* cpu_output = new float[output_size];
+        CUDA_CHECK(cudaMemcpyAsync(cpu_output, raw_output, output_size * sizeof(float),
+                                   cudaMemcpyDeviceToHost, streams[slot]));
+        CUDA_CHECK(cudaStreamSynchronize(streams[slot]));
+
+        for (int i = 0; i < num_detections; i++) {
+            float x1   = cpu_output[i * 6 + 0];
+            float y1   = cpu_output[i * 6 + 1];
+            float x2   = cpu_output[i * 6 + 2];
+            float y2   = cpu_output[i * 6 + 3];
+            float conf = cpu_output[i * 6 + 4];
+            int   cls  = (int)cpu_output[i * 6 + 5];
+            if (conf <= 0.0f) continue;
+            Detection det;
+            det.conf = conf;
+            det.class_id = cls;
+            det.bbox = Rect((int)x1, (int)y1, (int)(x2 - x1), (int)(y2 - y1));
+            output.push_back(det);
+        }
+        delete[] cpu_output;
+        return;
+    }
+
+    // ---- Non-NMS mode: GPU decode + CPU NMS (original path) ----
     CUDA_CHECK(cudaMemsetAsync(gpu_filtered_count[slot], 0, sizeof(int), streams[slot]));
 
     // ----- Step 2: GPU kernel: decode boxes + filter by confidence (async) -----
