@@ -65,6 +65,25 @@
 > | **NVDEC** | NVIDIA 显卡内置的硬件视频解码器，H.264/H.265 解码不占 CPU，单独用可达 1800+ fps |
 > | **FrameQueue** | 生产者-消费者队列：解码线程（生产者）提前读帧放入队列，推理线程（消费者）从队列取帧，解耦 I/O 与 GPU |
 
+### Pre / Infer / Post 计时明细
+
+`main.cpp` 中每帧的计时方式：
+
+```cpp
+auto t0 = now();  model.preprocess();  auto t1 = now();  // Pre = t1 - t0
+auto t2 = now();  model.infer();       auto t3 = now();  // Infer = t3 - t2 ← 仅 CPU 发射!
+/* ... */         model.postprocess(); auto t4 = now();  // Post = t4 - t3
+```
+
+| 阶段 | 计入了什么 | 没计什么 |
+|------|------|------|
+| **Pre** | `memcpy` 源帧→pinned、`cudaMemcpyAsync` 上传 GPU、`warpaffine` kernel 发射 | GPU 实际执行 warpaffine（异步） |
+| **Infer** | TensorRT `enqueueV3` 发射耗时（仅 CPU 侧，~0.02ms） | GPU 实际推理由此后的 `cudaStreamSynchronize` 隐式等待 |
+| **Post** | `cudaMemsetAsync`、GPU decode kernel 发射、`cudaMemcpyAsync` 下载、**`cudaStreamSynchronize`（阻塞等 GPU）**、CPU NMS | — |
+
+> **Infer 只计了 CPU 发射，真正的 GPU 推理时间被包含在 Post 的 `cudaStreamSynchronize` 里。**
+> 这也是为什么必须把 Pre+Infer+Post 加在一起看——它们共同构成从"开始干活"到"拿到结果"的完整 GPU+CPU 时间（即 pipeline 时间）。
+
 ### Python PyTorch Batch 对比
 
 | Batch       | 管线 FPS       | ms/帧           | ms/批          | 真实吞吐         | 总耗时           |
