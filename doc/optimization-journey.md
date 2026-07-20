@@ -58,7 +58,7 @@
 > | **检测框数量** | YOLOv11 是 anchor-free 模型，网格每个单元格直接预测 1 个框。数量 = 所有 stride 的 grid 总和。640×640 (stride=8/16/32): 80²+40²+20² = 8400；1920×1920: 240²+120²+60² = 75600。代码从 engine 自动读取 `num_detections` |
 > | **ExecutionContext** | TensorRT 的推理执行环境。一个 engine 可创建多个 context（共享权重），每个 context 独立执行推理。双 Stream 方案利用 2 个 context 实现流水线并行 |
 > | **CUDA Stream** | CUDA 的任务队列。同一 stream 内的操作顺序执行；不同 stream 间可并行。pre→infer→post 放在同一 stream 保证顺序，两个 stream 交替使用实现 GPU/CPU 重叠 |
-> | **管线 FPS vs 真实 FPS** | 管线 FPS = 1000 / (pre+infer+post 耗时)，只看 GPU 计算。真实 FPS = 总帧数 / 墙钟时间，含 I/O 等待。GPU 跑得再快，人等磁盘也是白等 |
+> | **管线 FPS vs 真实 FPS** | 管线 FPS = 1000 / (Pre+Infer+Post 每帧耗时)。包含：memcpy 上传/下载、warpaffine、TensorRT 推理、GPU decode kernel、cudaStreamSynchronize、CPU NMS。**不含**：视频解码、磁盘 I/O、队列等待、模型加载。真实 FPS 包含一切，是端到端墙钟速度 |
 > | **warpaffine** | 图像仿射变换（缩放+裁剪+平移），将任意分辨率视频帧映射到模型固定输入尺寸（1920×1920），同时完成 letterbox 填充 |
 > | **NMS (Non-Maximum Suppression)** | 非极大值抑制：同一目标被多个框检出时，保留置信度最高的，删除重叠过高的冗余框 |
 > | **pinned memory** | `cudaMallocHost` 分配的 CPU 内存，GPU 可通过 DMA 直接访问，上传带宽 ~12 GB/s（普通内存仅 ~3 GB/s） |
