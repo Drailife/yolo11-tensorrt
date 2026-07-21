@@ -2,6 +2,7 @@
 
 #include "NvInfer.h"
 #include <opencv2/opencv.hpp>
+#include <cstdint>
 
 using namespace nvinfer1;
 using namespace std;
@@ -12,6 +13,18 @@ struct Detection
     float conf;
     int class_id;
     Rect bbox;
+};
+
+struct DetailedTimingStats
+{
+    double preprocess_gpu_ms = 0.0;   // H2D + warpaffine, accumulated per batch
+    double inference_gpu_ms = 0.0;    // TensorRT execution, accumulated per batch
+    double post_decode_gpu_ms = 0.0;  // Decode/filter kernel + filtered-count D2H
+    double post_copy_gpu_ms = 0.0;    // Detection-result D2H
+    double post_wait_cpu_ms = 0.0;    // Time blocked in existing stream synchronizations
+    double post_cpu_ms = 0.0;         // Result parsing/vector construction/NMS
+    uint64_t batches = 0;
+    uint64_t frames = 0;
 };
 
 class YOLOv11
@@ -29,6 +42,8 @@ public:
     void syncSlot(int slot);
 
     int getBatchSize() const { return batch_size; }    //!< Engine batch size
+    bool detailedTimingEnabled() const { return detailed_timing_enabled; }
+    const DetailedTimingStats& getDetailedTimingStats() const { return detailed_timing_stats; }
 
     // ---- Legacy single-stream API (backward compat) ----
     void preprocess(Mat& image) { preprocess(image, 0); }
@@ -47,8 +62,24 @@ private:
     float* cpu_filtered_boxes[NUM_STREAMS] = {nullptr, nullptr};
 
     cudaStream_t streams[NUM_STREAMS] = {nullptr, nullptr};
-    cudaEvent_t  events[NUM_STREAMS]  = {nullptr, nullptr};
     IExecutionContext* contexts[NUM_STREAMS] = {nullptr, nullptr};
+
+    // Optional, non-blocking detailed timing. Enabled with YOLO_DETAILED_TIMING=1.
+    enum TimingEvent {
+        PREPROCESS_START,
+        PREPROCESS_END,
+        INFERENCE_START,
+        INFERENCE_END,
+        POST_DECODE_START,
+        POST_DECODE_END,
+        POST_COPY_START,
+        POST_COPY_END,
+        TIMING_EVENT_COUNT
+    };
+    cudaEvent_t timing_events[NUM_STREAMS][TIMING_EVENT_COUNT] = {};
+    bool timing_batch_pending[NUM_STREAMS] = {false, false};
+    bool detailed_timing_enabled = false;
+    DetailedTimingStats detailed_timing_stats;
 
     bool inference_initialized = false;
 
@@ -69,5 +100,7 @@ private:
 
     vector<Scalar> colors;
 
+    void collectBatchGpuTiming(int slot);
+    float elapsedGpuMs(int slot, TimingEvent start, TimingEvent end) const;
     void build(std::string onnxPath, nvinfer1::ILogger& logger);
 };

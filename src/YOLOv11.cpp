@@ -6,6 +6,9 @@
 #include "postprocess.h"
 #include <NvOnnxParser.h>
 #include "common.h"
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 
@@ -36,6 +39,11 @@ YOLOv11::YOLOv11(string model_path, nvinfer1::ILogger& logger)
 
 void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
 {
+    const char* timing_env = std::getenv("YOLO_DETAILED_TIMING");
+    detailed_timing_enabled = timing_env != nullptr &&
+                              std::strcmp(timing_env, "0") != 0 &&
+                              std::strlen(timing_env) != 0;
+
     // Read the engine file
     ifstream engineStream(engine_path, ios::binary);
     engineStream.seekg(0, ios::end);
@@ -99,9 +107,13 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
             cpu_filtered_boxes[s] = new float[MAX_OUTPUT_DETECTIONS * 6];
         }
 
-        // Stream + event per slot
+        // Stream per slot
         CUDA_CHECK(cudaStreamCreate(&streams[s]));
-        CUDA_CHECK(cudaEventCreate(&events[s]));
+        if (detailed_timing_enabled) {
+            for (int e = 0; e < TIMING_EVENT_COUNT; e++) {
+                CUDA_CHECK(cudaEventCreate(&timing_events[s][e]));
+            }
+        }
     }
 
     cuda_preprocess_init(MAX_IMAGE_SIZE);
@@ -114,6 +126,10 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
         printf("model warmup 2 times\n");
     }
 
+    if (detailed_timing_enabled) {
+        printf("Detailed timing enabled (CUDA events, no additional stream synchronization)\n");
+    }
+
     inference_initialized = true;
 }
 
@@ -123,7 +139,11 @@ YOLOv11::~YOLOv11()
         for (int s = 0; s < NUM_STREAMS; s++) {
             CUDA_CHECK(cudaStreamSynchronize(streams[s]));
             CUDA_CHECK(cudaStreamDestroy(streams[s]));
-            CUDA_CHECK(cudaEventDestroy(events[s]));
+            if (detailed_timing_enabled) {
+                for (int e = 0; e < TIMING_EVENT_COUNT; e++) {
+                    CUDA_CHECK(cudaEventDestroy(timing_events[s][e]));
+                }
+            }
             CUDA_CHECK(cudaFree(gpu_buffers[s][0]));
             CUDA_CHECK(cudaFree(gpu_buffers[s][1]));
             if (!has_nms) {
@@ -144,21 +164,60 @@ YOLOv11::~YOLOv11()
 void YOLOv11::preprocess(Mat& image, int slot, int batch_idx) {
     // Launch GPU preprocess on stream[slot] — writes to batch slot
     float* dst = gpu_buffers[slot][0] + batch_idx * 3 * input_w * input_h;
+    if (detailed_timing_enabled && inference_initialized && batch_idx == 0) {
+        CUDA_CHECK(cudaEventRecord(timing_events[slot][PREPROCESS_START], streams[slot]));
+    }
     cuda_preprocess(image.ptr(), image.cols, image.rows,
                     dst, input_w, input_h, streams[slot]);
 }
 
 void YOLOv11::infer(int slot)
 {
+    const bool capture_timing = detailed_timing_enabled && inference_initialized;
+    if (capture_timing) {
+        // Both events are placed after all preprocess calls for this batch.
+        CUDA_CHECK(cudaEventRecord(timing_events[slot][PREPROCESS_END], streams[slot]));
+        CUDA_CHECK(cudaEventRecord(timing_events[slot][INFERENCE_START], streams[slot]));
+    }
 #if NV_TENSORRT_MAJOR < 10
     contexts[slot]->enqueueV2((void**)gpu_buffers[slot], streams[slot], nullptr);
 #else
     contexts[slot]->enqueueV3(streams[slot]);
 #endif
+    if (capture_timing) {
+        CUDA_CHECK(cudaEventRecord(timing_events[slot][INFERENCE_END], streams[slot]));
+        timing_batch_pending[slot] = true;
+    }
+}
+
+float YOLOv11::elapsedGpuMs(int slot, TimingEvent start, TimingEvent end) const
+{
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms,
+                                    timing_events[slot][start],
+                                    timing_events[slot][end]));
+    return elapsed_ms;
+}
+
+void YOLOv11::collectBatchGpuTiming(int slot)
+{
+    if (!detailed_timing_enabled || !timing_batch_pending[slot]) return;
+
+    // Called only after postprocess's existing stream synchronization, so these
+    // event queries do not introduce a new wait or serialize the pipeline.
+    detailed_timing_stats.preprocess_gpu_ms +=
+        elapsedGpuMs(slot, PREPROCESS_START, PREPROCESS_END);
+    detailed_timing_stats.inference_gpu_ms +=
+        elapsedGpuMs(slot, INFERENCE_START, INFERENCE_END);
+    detailed_timing_stats.batches++;
+    timing_batch_pending[slot] = false;
 }
 
 void YOLOv11::postprocess(vector<Detection>& output, int slot, int batch_idx)
 {
+    using TimingClock = std::chrono::steady_clock;
+    const bool capture_timing = detailed_timing_enabled && inference_initialized;
+
     // Raw output for this batch element: offset in the full batched buffer
     int per_image_size = detection_attribute_size * num_detections;
     float* raw_output = gpu_buffers[slot][1] + batch_idx * per_image_size;
@@ -167,10 +226,27 @@ void YOLOv11::postprocess(vector<Detection>& output, int slot, int batch_idx)
         // ---- NMS mode: engine already outputs [num_dets, 6] NMS'd results ----
         int output_size = num_detections * detection_attribute_size;  // 300 * 6
         float* cpu_output = new float[output_size];
+        if (capture_timing) {
+            CUDA_CHECK(cudaEventRecord(timing_events[slot][POST_COPY_START], streams[slot]));
+        }
         CUDA_CHECK(cudaMemcpyAsync(cpu_output, raw_output, output_size * sizeof(float),
                                    cudaMemcpyDeviceToHost, streams[slot]));
+        if (capture_timing) {
+            CUDA_CHECK(cudaEventRecord(timing_events[slot][POST_COPY_END], streams[slot]));
+        }
+        TimingClock::time_point wait_start;
+        if (capture_timing) wait_start = TimingClock::now();
         CUDA_CHECK(cudaStreamSynchronize(streams[slot]));
+        if (capture_timing) {
+            detailed_timing_stats.post_wait_cpu_ms +=
+                std::chrono::duration<double, std::milli>(TimingClock::now() - wait_start).count();
+            collectBatchGpuTiming(slot);
+            detailed_timing_stats.post_copy_gpu_ms +=
+                elapsedGpuMs(slot, POST_COPY_START, POST_COPY_END);
+        }
 
+        TimingClock::time_point cpu_start;
+        if (capture_timing) cpu_start = TimingClock::now();
         for (int i = 0; i < num_detections; i++) {
             float x1   = cpu_output[i * 6 + 0];
             float y1   = cpu_output[i * 6 + 1];
@@ -186,10 +262,18 @@ void YOLOv11::postprocess(vector<Detection>& output, int slot, int batch_idx)
             output.push_back(det);
         }
         delete[] cpu_output;
+        if (capture_timing) {
+            detailed_timing_stats.post_cpu_ms +=
+                std::chrono::duration<double, std::milli>(TimingClock::now() - cpu_start).count();
+            detailed_timing_stats.frames++;
+        }
         return;
     }
 
     // ---- Non-NMS mode: GPU decode + CPU NMS (original path) ----
+    if (capture_timing) {
+        CUDA_CHECK(cudaEventRecord(timing_events[slot][POST_DECODE_START], streams[slot]));
+    }
     CUDA_CHECK(cudaMemsetAsync(gpu_filtered_count[slot], 0, sizeof(int), streams[slot]));
 
     // ----- Step 2: GPU kernel: decode boxes + filter by confidence (async) -----
@@ -206,20 +290,51 @@ void YOLOv11::postprocess(vector<Detection>& output, int slot, int batch_idx)
     int filtered_count = 0;
     CUDA_CHECK(cudaMemcpyAsync(&filtered_count, gpu_filtered_count[slot], sizeof(int),
                                cudaMemcpyDeviceToHost, streams[slot]));
+    if (capture_timing) {
+        CUDA_CHECK(cudaEventRecord(timing_events[slot][POST_DECODE_END], streams[slot]));
+    }
 
     // ----- Step 4: Sync: wait for all GPU work on this slot -----
+    TimingClock::time_point first_wait_start;
+    if (capture_timing) first_wait_start = TimingClock::now();
     CUDA_CHECK(cudaStreamSynchronize(streams[slot]));
+    if (capture_timing) {
+        detailed_timing_stats.post_wait_cpu_ms +=
+            std::chrono::duration<double, std::milli>(TimingClock::now() - first_wait_start).count();
+        collectBatchGpuTiming(slot);
+        detailed_timing_stats.post_decode_gpu_ms +=
+            elapsedGpuMs(slot, POST_DECODE_START, POST_DECODE_END);
+    }
 
-    if (filtered_count == 0) return;
+    if (filtered_count == 0) {
+        if (capture_timing) detailed_timing_stats.frames++;
+        return;
+    }
     if (filtered_count > MAX_OUTPUT_DETECTIONS) filtered_count = MAX_OUTPUT_DETECTIONS;
 
     // ----- Step 5: Copy filtered detections (GPU is done, safe to use sync memcpy) -----
+    if (capture_timing) {
+        CUDA_CHECK(cudaEventRecord(timing_events[slot][POST_COPY_START], streams[slot]));
+    }
     CUDA_CHECK(cudaMemcpyAsync(cpu_filtered_boxes[slot], gpu_filtered_boxes[slot],
                                filtered_count * 6 * sizeof(float),
                                cudaMemcpyDeviceToHost, streams[slot]));
+    if (capture_timing) {
+        CUDA_CHECK(cudaEventRecord(timing_events[slot][POST_COPY_END], streams[slot]));
+    }
+    TimingClock::time_point second_wait_start;
+    if (capture_timing) second_wait_start = TimingClock::now();
     CUDA_CHECK(cudaStreamSynchronize(streams[slot]));
+    if (capture_timing) {
+        detailed_timing_stats.post_wait_cpu_ms +=
+            std::chrono::duration<double, std::milli>(TimingClock::now() - second_wait_start).count();
+        detailed_timing_stats.post_copy_gpu_ms +=
+            elapsedGpuMs(slot, POST_COPY_START, POST_COPY_END);
+    }
 
     // ----- Step 6: Build detection lists + CPU NMS -----
+    TimingClock::time_point cpu_start;
+    if (capture_timing) cpu_start = TimingClock::now();
     vector<Rect> boxes;
     vector<int> class_ids;
     vector<float> confidences;
@@ -257,6 +372,11 @@ void YOLOv11::postprocess(vector<Detection>& output, int slot, int batch_idx)
         result.conf = confidences[idx];
         result.bbox = boxes[idx];
         output.push_back(result);
+    }
+    if (capture_timing) {
+        detailed_timing_stats.post_cpu_ms +=
+            std::chrono::duration<double, std::milli>(TimingClock::now() - cpu_start).count();
+        detailed_timing_stats.frames++;
     }
 }
 
