@@ -79,9 +79,10 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
         num_detections = output_dims.d[2];
     }
 #endif
-    num_classes = detection_attribute_size - 4;
     // Auto-detect NMS model: if det_attr <= 6, NMS is built into the engine
     has_nms = (detection_attribute_size <= 6);
+    // num_classes only meaningful for non-NMS; NMS output has class_id directly
+    num_classes = has_nms ? 0 : detection_attribute_size - 4;
     printf("Model: batch=%d, input=%dx%d, det_attr=%d, num_dets=%d, classes=%d, NMS=%s\n",
            batch_size, input_w, input_h, detection_attribute_size, num_detections, num_classes,
            has_nms ? "built-in" : "CPU");
