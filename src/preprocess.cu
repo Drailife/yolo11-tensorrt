@@ -1,9 +1,21 @@
 #include "preprocess.h"
 #include "cuda_utils.h"
 #include "device_launch_parameters.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
-static uint8_t* img_buffer_host = nullptr;
-static uint8_t* img_buffer_device = nullptr;
+struct PreprocessStagingBuffer {
+    uint8_t* host = nullptr;
+    uint8_t* device = nullptr;
+    size_t capacity = 0;
+};
+
+static std::vector<PreprocessStagingBuffer> staging_buffers;
+static size_t max_image_bytes = 0;
+static int staging_num_streams = 0;
+static int staging_batch_size = 0;
 
 struct AffineMatrix {
     float value[6];
@@ -97,13 +109,46 @@ __global__ void warpaffine_kernel(
 void cuda_preprocess(
     uint8_t* src, int src_width, int src_height,
     float* dst, int dst_width, int dst_height,
-    cudaStream_t stream) {
+    cudaStream_t stream, int slot, int batch_idx) {
 
-    int img_size = src_width * src_height * 3;
+    if (slot < 0 || slot >= staging_num_streams ||
+        batch_idx < 0 || batch_idx >= staging_batch_size) {
+        std::fprintf(stderr,
+                     "Invalid preprocess staging buffer index: slot=%d, batch_idx=%d\n",
+                     slot, batch_idx);
+        std::abort();
+    }
+
+    const size_t img_size = static_cast<size_t>(src_width) * src_height * 3;
+    if (img_size > max_image_bytes) {
+        std::fprintf(stderr,
+                     "Source image requires %zu bytes, exceeding preprocess limit %zu bytes\n",
+                     img_size, max_image_bytes);
+        std::abort();
+    }
+
+    const int buffer_index = slot * staging_batch_size + batch_idx;
+    PreprocessStagingBuffer& staging = staging_buffers[buffer_index];
+
+    // Allocate to the actual source-frame size. Growth is rare, but the old
+    // buffer may still be referenced by queued work on this stream, so wait
+    // before replacing it.
+    if (staging.capacity < img_size) {
+        if (staging.capacity != 0) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaFree(staging.device));
+            CUDA_CHECK(cudaFreeHost(staging.host));
+        }
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&staging.host), img_size));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&staging.device), img_size));
+        staging.capacity = img_size;
+    }
+
     // copy data to pinned memory
-    memcpy(img_buffer_host, src, img_size);
+    std::memcpy(staging.host, src, img_size);
     // copy data to device memory
-    CUDA_CHECK(cudaMemcpyAsync(img_buffer_device, img_buffer_host, img_size, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(staging.device, staging.host, img_size,
+                               cudaMemcpyHostToDevice, stream));
 
     AffineMatrix s2d, d2s;
     float scale = std::min(dst_height / (float)src_height, dst_width / (float)src_width);
@@ -126,19 +171,30 @@ void cuda_preprocess(
     int blocks = ceil(jobs / (float)threads);
 
     warpaffine_kernel << <blocks, threads, 0, stream >> > (
-        img_buffer_device, src_width * 3, src_width,
+        staging.device, src_width * 3, src_width,
         src_height, dst, dst_width,
         dst_height, 128, d2s, jobs);
 }
 
-void cuda_preprocess_init(int max_image_size) {
-    // prepare input data in pinned memory
-    CUDA_CHECK(cudaMallocHost((void**)&img_buffer_host, max_image_size * 3));
-    // prepare input data in device memory
-    CUDA_CHECK(cudaMalloc((void**)&img_buffer_device, max_image_size * 3));
+void cuda_preprocess_init(int max_image_size, int num_streams, int batch_size) {
+    max_image_bytes = static_cast<size_t>(max_image_size) * 3;
+    staging_num_streams = num_streams;
+    staging_batch_size = batch_size;
+    staging_buffers.clear();
+    staging_buffers.resize(static_cast<size_t>(num_streams) * batch_size);
 }
 
 void cuda_preprocess_destroy() {
-    CUDA_CHECK(cudaFree(img_buffer_device));
-    CUDA_CHECK(cudaFreeHost(img_buffer_host));
+    for (PreprocessStagingBuffer& staging : staging_buffers) {
+        if (staging.device != nullptr) {
+            CUDA_CHECK(cudaFree(staging.device));
+        }
+        if (staging.host != nullptr) {
+            CUDA_CHECK(cudaFreeHost(staging.host));
+        }
+    }
+    staging_buffers.clear();
+    max_image_bytes = 0;
+    staging_num_streams = 0;
+    staging_batch_size = 0;
 }

@@ -117,7 +117,7 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
         }
     }
 
-    cuda_preprocess_init(MAX_IMAGE_SIZE);
+    cuda_preprocess_init(MAX_IMAGE_SIZE, NUM_STREAMS, batch_size);
 
     // Warmup on slot 0
     if (warmup) {
@@ -169,7 +169,7 @@ void YOLOv11::preprocess(Mat& image, int slot, int batch_idx) {
         CUDA_CHECK(cudaEventRecord(timing_events[slot][PREPROCESS_START], streams[slot]));
     }
     cuda_preprocess(image.ptr(), image.cols, image.rows,
-                    dst, input_w, input_h, streams[slot]);
+                    dst, input_w, input_h, streams[slot], slot, batch_idx);
 }
 
 void YOLOv11::infer(int slot)
