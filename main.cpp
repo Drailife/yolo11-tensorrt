@@ -7,12 +7,42 @@
 #endif
 
 #include <iostream>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <string>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <vector>
 #include "YOLOv11.h"
+
+
+struct FrameQueueStats {
+    double pop_wait_ms = 0.0;
+    double pop_wait_p95_ms = 0.0;
+    double pop_wait_p99_ms = 0.0;
+    double pop_wait_max_ms = 0.0;
+    double push_wait_ms = 0.0;
+    double push_wait_max_ms = 0.0;
+    double average_depth = 0.0;
+    uint64_t pop_wait_events = 0;
+    uint64_t push_wait_events = 0;
+    uint64_t pushed_frames = 0;
+    uint64_t popped_frames = 0;
+    size_t max_depth = 0;
+    size_t capacity = 0;
+};
+
+
+struct VideoProducerStats {
+    double read_decode_ms = 0.0;
+    double read_decode_max_ms = 0.0;
+    double wall_ms = 0.0;
+    uint64_t decoded_frames = 0;
+};
 
 
 /**
@@ -21,11 +51,14 @@
  * Producer thread reads frames from video and pushes them into the queue.
  * Consumer (main thread) pops frames for inference.
  * This decouples I/O from GPU computation: while GPU is busy, the producer
- * pre-reads frames so the GPU never waits for disk or video decoding.
+ * pre-reads frames and reduces consumer stalls when decoding can keep up.
  */
 class FrameQueue {
 public:
-    explicit FrameQueue(size_t max_size = 64) : max_size_(max_size) {}
+    explicit FrameQueue(size_t max_size = 64)
+        : max_size_(max_size),
+          stats_start_(StatsClock::now()),
+          last_depth_update_(stats_start_) {}
 
     /**
      * @brief Push a frame into the queue (called by producer thread).
@@ -33,10 +66,22 @@ public:
      */
     void push(cv::Mat frame) {
         std::unique_lock<std::mutex> lock(mtx_);
-        // Wait until there's room in the queue
-        cv_not_full_.wait(lock, [this] { return q_.size() < max_size_ || done_; });
+
+        if (q_.size() >= max_size_ && !done_) {
+            const auto wait_start = StatsClock::now();
+            push_wait_events_++;
+            cv_not_full_.wait(lock, [this] { return q_.size() < max_size_ || done_; });
+            const double wait_ms = elapsedMs(wait_start, StatsClock::now());
+            push_wait_ms_ += wait_ms;
+            push_wait_max_ms_ = std::max(push_wait_max_ms_, wait_ms);
+        }
+
         if (done_) return;  // Shouldn't happen, but safety
+
+        updateDepthAreaLocked(StatsClock::now());
         q_.push(std::move(frame));
+        pushed_frames_++;
+        max_depth_ = std::max(max_depth_, q_.size());
         cv_not_empty_.notify_one();  // Wake up consumer
     }
 
@@ -46,11 +91,24 @@ public:
      */
     bool pop(cv::Mat& frame) {
         std::unique_lock<std::mutex> lock(mtx_);
-        // Wait until there's a frame available OR producer is done
-        cv_not_empty_.wait(lock, [this] { return !q_.empty() || (done_ && q_.empty()); });
+
+        double wait_ms = 0.0;
+        if (q_.empty() && !done_) {
+            const auto wait_start = StatsClock::now();
+            pop_wait_events_++;
+            cv_not_empty_.wait(lock, [this] { return !q_.empty() || done_; });
+            wait_ms = elapsedMs(wait_start, StatsClock::now());
+            pop_wait_ms_ += wait_ms;
+            pop_wait_max_ms_ = std::max(pop_wait_max_ms_, wait_ms);
+        }
+
         if (q_.empty() && done_) return false;  // All frames consumed
+
+        updateDepthAreaLocked(StatsClock::now());
         frame = std::move(q_.front());
         q_.pop();
+        popped_frames_++;
+        pop_wait_samples_ms_.push_back(wait_ms);
         cv_not_full_.notify_one();  // Wake up producer (room available)
         return true;
     }
@@ -61,17 +119,79 @@ public:
      */
     void setDone() {
         std::unique_lock<std::mutex> lock(mtx_);
+        updateDepthAreaLocked(StatsClock::now());
         done_ = true;
         cv_not_empty_.notify_all();
     }
 
+    FrameQueueStats stats() {
+        std::unique_lock<std::mutex> lock(mtx_);
+        const auto now = StatsClock::now();
+        updateDepthAreaLocked(now);
+
+        FrameQueueStats result;
+        result.pop_wait_ms = pop_wait_ms_;
+        result.pop_wait_max_ms = pop_wait_max_ms_;
+        result.push_wait_ms = push_wait_ms_;
+        result.push_wait_max_ms = push_wait_max_ms_;
+        result.pop_wait_events = pop_wait_events_;
+        result.push_wait_events = push_wait_events_;
+        result.pushed_frames = pushed_frames_;
+        result.popped_frames = popped_frames_;
+        result.max_depth = max_depth_;
+        result.capacity = max_size_;
+
+        const double elapsed_ms = elapsedMs(stats_start_, now);
+        result.average_depth = elapsed_ms > 0.0 ? depth_time_area_ / elapsed_ms : 0.0;
+
+        if (!pop_wait_samples_ms_.empty()) {
+            std::vector<double> sorted_samples = pop_wait_samples_ms_;
+            std::sort(sorted_samples.begin(), sorted_samples.end());
+            result.pop_wait_p95_ms = percentile(sorted_samples, 0.95);
+            result.pop_wait_p99_ms = percentile(sorted_samples, 0.99);
+        }
+        return result;
+    }
+
 private:
+    using StatsClock = std::chrono::steady_clock;
+
+    static double elapsedMs(StatsClock::time_point start, StatsClock::time_point end) {
+        return std::chrono::duration<double, std::milli>(end - start).count();
+    }
+
+    static double percentile(const std::vector<double>& sorted_samples, double quantile) {
+        const size_t index = static_cast<size_t>(
+            std::ceil(quantile * static_cast<double>(sorted_samples.size()))) - 1;
+        return sorted_samples[std::min(index, sorted_samples.size() - 1)];
+    }
+
+    void updateDepthAreaLocked(StatsClock::time_point now) {
+        const double elapsed_ms = elapsedMs(last_depth_update_, now);
+        depth_time_area_ += elapsed_ms * static_cast<double>(q_.size());
+        last_depth_update_ = now;
+    }
+
     std::queue<cv::Mat> q_;
     std::mutex mtx_;
     std::condition_variable cv_not_empty_;  // Consumer waits on this
     std::condition_variable cv_not_full_;   // Producer waits on this (back-pressure)
     size_t max_size_;
     bool done_ = false;
+
+    StatsClock::time_point stats_start_;
+    StatsClock::time_point last_depth_update_;
+    double depth_time_area_ = 0.0;  // Integral of queue depth over milliseconds.
+    double pop_wait_ms_ = 0.0;
+    double pop_wait_max_ms_ = 0.0;
+    double push_wait_ms_ = 0.0;
+    double push_wait_max_ms_ = 0.0;
+    uint64_t pop_wait_events_ = 0;
+    uint64_t push_wait_events_ = 0;
+    uint64_t pushed_frames_ = 0;
+    uint64_t popped_frames_ = 0;
+    size_t max_depth_ = 0;
+    std::vector<double> pop_wait_samples_ms_;
 };
 
 
@@ -234,17 +354,32 @@ int main(int argc, char** argv)
 
         // ================================================================
         //  Async frame decoding: producer thread reads frames ahead of time
-        //  so the GPU pipeline never waits for disk I/O or video decode.
+        //  to reduce GPU pipeline waits when video decoding can keep up.
         // ================================================================
         FrameQueue frame_queue(128);  // Buffer up to 128 frames (~2GB for 1920x1920)
+        VideoProducerStats producer_stats;
 
         // Producer thread: continuously read frames from video
         std::thread producer([&]() {
+            const auto producer_start = std::chrono::steady_clock::now();
             cv::Mat frame;
-            while (cap.read(frame)) {
+            while (true) {
+                const auto read_start = std::chrono::steady_clock::now();
+                const bool read_ok = cap.read(frame);
+                const auto read_end = std::chrono::steady_clock::now();
+                if (!read_ok) break;
+
+                const double read_ms =
+                    std::chrono::duration<double, std::milli>(read_end - read_start).count();
+                producer_stats.read_decode_ms += read_ms;
+                producer_stats.read_decode_max_ms =
+                    std::max(producer_stats.read_decode_max_ms, read_ms);
+                producer_stats.decoded_frames++;
                 frame_queue.push(std::move(frame));
             }
             frame_queue.setDone();  // Signal consumer: no more frames
+            producer_stats.wall_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - producer_start).count();
         });
 
         // ---- Dual-stream + batched inference (consumer = main thread) ----
@@ -360,6 +495,14 @@ int main(int argc, char** argv)
         cap.release();
         if (save_output) {
             video_writer.release();
+        }
+
+        // Stop end-to-end timing before sorting/reporting diagnostic samples.
+        auto inference_wall_end = std::chrono::system_clock::now();
+        double wall_sec = std::chrono::duration<double>(inference_wall_end - inference_wall_start).count();
+        const FrameQueueStats queue_stats = frame_queue.stats();
+
+        if (save_output) {
             printf("Output saved to: %s\n", output_path.c_str());
         }
 
@@ -375,11 +518,49 @@ int main(int argc, char** argv)
         printf("  stage wall sum:         %.2f ms/frame  (%.1f FPS equivalent)\n",
                (total_pre_ms + total_inf_ms + total_post_ms) / frame_count,
                1000.0 * frame_count / (total_pre_ms + total_inf_ms + total_post_ms));
+        printf("--- Queue / producer diagnostics ---\n");
+        printf("  queue_pop_wait_ms/frame:  %.3f  (%.1f%% wall; %llu empty waits, p95 %.3f, p99 %.3f, max %.3f ms)\n",
+               queue_stats.pop_wait_ms / frame_count,
+               100.0 * queue_stats.pop_wait_ms / (wall_sec * 1000.0),
+               static_cast<unsigned long long>(queue_stats.pop_wait_events),
+               queue_stats.pop_wait_p95_ms,
+               queue_stats.pop_wait_p99_ms,
+               queue_stats.pop_wait_max_ms);
+        printf("  queue_push_wait_ms/frame: %.3f  (%.1f%% producer wall; %llu full waits, max %.3f ms)\n",
+               producer_stats.decoded_frames > 0
+                   ? queue_stats.push_wait_ms / producer_stats.decoded_frames : 0.0,
+               producer_stats.wall_ms > 0.0
+                   ? 100.0 * queue_stats.push_wait_ms / producer_stats.wall_ms : 0.0,
+               static_cast<unsigned long long>(queue_stats.push_wait_events),
+               queue_stats.push_wait_max_ms);
+        printf("  queue depth average/max:  %.2f / %zu frames  (capacity %zu, pushed/popped %llu/%llu)\n",
+               queue_stats.average_depth,
+               queue_stats.max_depth,
+               queue_stats.capacity,
+               static_cast<unsigned long long>(queue_stats.pushed_frames),
+               static_cast<unsigned long long>(queue_stats.popped_frames));
+
+        const double decoded_frames = static_cast<double>(producer_stats.decoded_frames);
+        const double read_ms_per_frame = decoded_frames > 0.0
+            ? producer_stats.read_decode_ms / decoded_frames : 0.0;
+        const double producer_ms_per_frame = decoded_frames > 0.0
+            ? producer_stats.wall_ms / decoded_frames : 0.0;
+        printf("  video read/decode:         %.3f ms/frame  (%.1f FPS, max %.3f ms)\n",
+               read_ms_per_frame,
+               producer_stats.read_decode_ms > 0.0
+                   ? 1000.0 * decoded_frames / producer_stats.read_decode_ms : 0.0,
+               producer_stats.read_decode_max_ms);
+        printf("  producer effective:        %.3f ms/frame  (%.1f FPS incl. queue back-pressure)\n",
+               producer_ms_per_frame,
+               producer_stats.wall_ms > 0.0
+                   ? 1000.0 * decoded_frames / producer_stats.wall_ms : 0.0);
+        printf("  batch fill average:        %.3f/%d frames  (%.1f%%)\n",
+               static_cast<double>(frame_count) / batch_count,
+               B,
+               100.0 * frame_count / (static_cast<double>(batch_count) * B));
         printDetailedTiming(model);
 
         // Real end-to-end throughput: wall clock from first frame to last frame
-        auto inference_wall_end = std::chrono::system_clock::now();
-        double wall_sec = std::chrono::duration<double>(inference_wall_end - inference_wall_start).count();
         printf("  real:        %.2f ms/frame  (%.1f end-to-end FPS, %.1fs wall clock)\n",
                1000.0 * wall_sec / frame_count, frame_count / wall_sec, wall_sec);
     }
@@ -470,6 +651,10 @@ int main(int argc, char** argv)
 
         producer.join();
 
+        auto inference_wall_end = std::chrono::system_clock::now();
+        double wall_sec = std::chrono::duration<double>(inference_wall_end - inference_wall_start).count();
+        const FrameQueueStats queue_stats = frame_queue.stats();
+
         printf("--- Dual-stream + Batch%d + Images (%d frames) ---\n", B, frame_count);
         printf("  preprocess host submit: %.2f ms/frame\n", total_pre_ms / frame_count);
         printf("  inference enqueue:      %.2f ms/batch  (%.2f ms/frame)\n",
@@ -478,10 +663,30 @@ int main(int argc, char** argv)
         printf("  stage wall sum:         %.2f ms/frame  (%.1f FPS equivalent)\n",
                (total_pre_ms + total_inf_ms + total_post_ms) / frame_count,
                1000.0 * frame_count / (total_pre_ms + total_inf_ms + total_post_ms));
+        printf("--- Queue diagnostics ---\n");
+        printf("  queue_pop_wait_ms/frame:  %.3f  (%.1f%% wall; %llu empty waits, p95 %.3f, p99 %.3f, max %.3f ms)\n",
+               queue_stats.pop_wait_ms / frame_count,
+               100.0 * queue_stats.pop_wait_ms / (wall_sec * 1000.0),
+               static_cast<unsigned long long>(queue_stats.pop_wait_events),
+               queue_stats.pop_wait_p95_ms,
+               queue_stats.pop_wait_p99_ms,
+               queue_stats.pop_wait_max_ms);
+        printf("  queue_push_wait_ms/frame: %.3f  (%llu full waits, max %.3f ms)\n",
+               queue_stats.push_wait_ms / frame_count,
+               static_cast<unsigned long long>(queue_stats.push_wait_events),
+               queue_stats.push_wait_max_ms);
+        printf("  queue depth average/max:  %.2f / %zu frames  (capacity %zu, pushed/popped %llu/%llu)\n",
+               queue_stats.average_depth,
+               queue_stats.max_depth,
+               queue_stats.capacity,
+               static_cast<unsigned long long>(queue_stats.pushed_frames),
+               static_cast<unsigned long long>(queue_stats.popped_frames));
+        printf("  batch fill average:        %.3f/%d frames  (%.1f%%)\n",
+               static_cast<double>(frame_count) / batch_count,
+               B,
+               100.0 * frame_count / (static_cast<double>(batch_count) * B));
         printDetailedTiming(model);
 
-        auto inference_wall_end = std::chrono::system_clock::now();
-        double wall_sec = std::chrono::duration<double>(inference_wall_end - inference_wall_start).count();
         printf("  real:        %.2f ms/frame  (%.1f end-to-end FPS, %.1fs wall clock)\n",
                1000.0 * wall_sec / frame_count, frame_count / wall_sec, wall_sec);
     }
