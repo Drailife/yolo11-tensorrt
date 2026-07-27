@@ -82,6 +82,29 @@ Perform object detection on a video:
 ./yolov11-tensorrt.exe yolo11s.engine "road.mp4"
 ```
 
+### Single-stream and Dual-stream Modes
+
+Dual-stream mode is used by default. Select the mode with `YOLO_NUM_STREAMS`:
+
+```bash
+# Single stream: pre -> infer -> post on slot 0
+YOLO_NUM_STREAMS=1 ./build/yolov11-tensorrt model.engine video.mp4
+
+# Dual stream: two execution contexts and two alternating CUDA streams
+YOLO_NUM_STREAMS=2 ./build/yolov11-tensorrt model.engine video.mp4
+```
+
+Detailed non-blocking CUDA timing can be enabled independently:
+
+```bash
+YOLO_NUM_STREAMS=1 YOLO_DETAILED_TIMING=1 \
+  ./build/yolov11-tensorrt model.engine video.mp4
+```
+
+When detailed timing is disabled, CUDA timing events are not recorded. Enabling
+it does not add stream synchronization; event results are collected at the
+postprocess synchronization points that already exist in the inference path.
+
 ## License
 
 This project is licensed under the AGPL-3.0 License. See the [LICENSE](LICENSE) file for details.

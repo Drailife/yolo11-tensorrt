@@ -44,6 +44,19 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
                               std::strcmp(timing_env, "0") != 0 &&
                               std::strlen(timing_env) != 0;
 
+    const char* streams_env = std::getenv("YOLO_NUM_STREAMS");
+    if (streams_env != nullptr && std::strlen(streams_env) != 0) {
+        const int requested_streams = std::atoi(streams_env);
+        if (requested_streams == 1 || requested_streams == 2) {
+            active_stream_count = requested_streams;
+        } else {
+            fprintf(stderr,
+                    "Invalid YOLO_NUM_STREAMS=%s; expected 1 or 2. Using 2 streams.\n",
+                    streams_env);
+            active_stream_count = NUM_STREAMS;
+        }
+    }
+
     // Read the engine file
     ifstream engineStream(engine_path, ios::binary);
     engineStream.seekg(0, ios::end);
@@ -83,12 +96,12 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
     has_nms = (detection_attribute_size <= 6);
     // num_classes only meaningful for non-NMS; NMS output has class_id directly
     num_classes = has_nms ? 0 : detection_attribute_size - 4;
-    printf("Model: batch=%d, input=%dx%d, det_attr=%d, num_dets=%d, classes=%d, NMS=%s\n",
+    printf("Model: batch=%d, input=%dx%d, det_attr=%d, num_dets=%d, classes=%d, NMS=%s, streams=%d\n",
            batch_size, input_w, input_h, detection_attribute_size, num_detections, num_classes,
-           has_nms ? "built-in" : "CPU");
+           has_nms ? "built-in" : "CPU", active_stream_count);
 
     // ---- Per-slot initialization (2 slots for pipelining) ----
-    for (int s = 0; s < NUM_STREAMS; s++) {
+    for (int s = 0; s < active_stream_count; s++) {
         // Context per slot
         contexts[s] = engine->createExecutionContext();
 
@@ -117,7 +130,7 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
         }
     }
 
-    cuda_preprocess_init(MAX_IMAGE_SIZE, NUM_STREAMS, batch_size);
+    cuda_preprocess_init(MAX_IMAGE_SIZE, active_stream_count, batch_size);
 
     // Warmup on slot 0
     if (warmup) {
@@ -137,7 +150,7 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
 YOLOv11::~YOLOv11()
 {
     if (inference_initialized) {
-        for (int s = 0; s < NUM_STREAMS; s++) {
+        for (int s = 0; s < active_stream_count; s++) {
             CUDA_CHECK(cudaStreamSynchronize(streams[s]));
             CUDA_CHECK(cudaStreamDestroy(streams[s]));
             if (detailed_timing_enabled) {

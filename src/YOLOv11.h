@@ -42,6 +42,7 @@ public:
     void syncSlot(int slot);
 
     int getBatchSize() const { return batch_size; }    //!< Engine batch size
+    int getStreamCount() const { return active_stream_count; }
     bool detailedTimingEnabled() const { return detailed_timing_enabled; }
     const DetailedTimingStats& getDetailedTimingStats() const { return detailed_timing_stats; }
 
@@ -80,6 +81,7 @@ private:
     bool timing_batch_pending[NUM_STREAMS] = {false, false};
     bool detailed_timing_enabled = false;
     DetailedTimingStats detailed_timing_stats;
+    int active_stream_count = NUM_STREAMS;
 
     bool inference_initialized = false;
 

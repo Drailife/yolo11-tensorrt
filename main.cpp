@@ -267,6 +267,8 @@ int main(int argc, char** argv)
         printf("  Build engine:    %s <model.onnx>\n", argv[0]);
         printf("  Build && infer:  %s <model.onnx> <video_or_image>\n", argv[0]);
         printf("  Run inference:   %s <model.engine> <video_or_image> [output.mp4]\n", argv[0]);
+        printf("  Stream mode:     YOLO_NUM_STREAMS=1|2 (default: 2)\n");
+        printf("  Detailed timing: YOLO_DETAILED_TIMING=1\n");
         return 1;
     }
 
@@ -382,74 +384,52 @@ int main(int argc, char** argv)
                 std::chrono::steady_clock::now() - producer_start).count();
         });
 
-        // ---- Dual-stream + batched inference (consumer = main thread) ----
+        // ---- Configurable single/dual-stream batched inference ----
         double total_pre_ms = 0, total_inf_ms = 0, total_post_ms = 0;
         double total_draw_ms = 0, total_write_ms = 0;
         int frame_count = 0;
         int batch_count = 0;
         const int B = model.getBatchSize();
+        const int stream_count = model.getStreamCount();
 
         // Wall-clock timer: measures real end-to-end throughput including I/O
         auto inference_wall_start = std::chrono::system_clock::now();
-        // Double-buffered images: 2 slots × B frames each
+        // Two slots are allocated; single-stream mode only uses slot 0.
         vector<Mat> images_buf[2] = {vector<Mat>(B), vector<Mat>(B)};
 
-        // --- Load first batch into slot 0 ---
-        int cur_slot = 0;
-        int cur_actual = 0;
-        for (int b = 0; b < B; b++) {
-            if (!frame_queue.pop(images_buf[cur_slot][b])) break;
-            cur_actual++;
-        }
-        if (cur_actual == 0) { cap.release(); producer.join(); return 0; }
-
-        // Preprocess + infer batch 0 on slot 0 (async — no host sync)
-        auto t0 = std::chrono::system_clock::now();
-        for (int b = 0; b < cur_actual; b++)
-            model.preprocess(images_buf[cur_slot][b], cur_slot, b);
-        auto t1 = std::chrono::system_clock::now();
-        model.infer(cur_slot);
-        batch_count++;
-        auto t2 = std::chrono::system_clock::now();
-        total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.;
-        total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.;
-
-        // --- Pipeline loop ---
-        while (true) {
-            int nxt_slot = 1 - cur_slot;
-
-            // Pop next batch of frames from the pre-filled queue (non-blocking if buffered)
-            int nxt_actual = 0;
+        auto load_batch = [&](int slot) {
+            int actual = 0;
             for (int b = 0; b < B; b++) {
-                if (!frame_queue.pop(images_buf[nxt_slot][b])) break;
-                nxt_actual++;
+                if (!frame_queue.pop(images_buf[slot][b])) break;
+                actual++;
             }
-            if (nxt_actual == 0) break;  // No more frames
+            return actual;
+        };
 
-            // Launch GPU work for next batch (async on other stream)
-            // GPU starts working while CPU finishes current batch's postprocess
-            auto pp0 = std::chrono::system_clock::now();
-            for (int b = 0; b < nxt_actual; b++)
-                model.preprocess(images_buf[nxt_slot][b], nxt_slot, b);
-            auto pp1 = std::chrono::system_clock::now();
-            model.infer(nxt_slot);
+        auto launch_batch = [&](int slot, int actual) {
+            auto pre_start = std::chrono::system_clock::now();
+            for (int b = 0; b < actual; b++)
+                model.preprocess(images_buf[slot][b], slot, b);
+            auto pre_end = std::chrono::system_clock::now();
+            model.infer(slot);
+            auto infer_end = std::chrono::system_clock::now();
             batch_count++;
-            auto pp2 = std::chrono::system_clock::now();
-            total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(pp1 - pp0).count() / 1000.;
-            total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(pp2 - pp1).count() / 1000.;
+            total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(pre_end - pre_start).count() / 1000.;
+            total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(infer_end - pre_end).count() / 1000.;
+        };
 
-            // --- Finish current batch (GPU should be done by now) ---
+        auto finish_batch = [&](int slot, int actual) {
             auto tp0 = std::chrono::system_clock::now();
             const double draw_ms_before = total_draw_ms;
             const double write_ms_before = total_write_ms;
-            for (int b = 0; b < cur_actual; b++) {
+            for (int b = 0; b < actual; b++) {
                 vector<Detection> objects;
-                model.postprocess(objects, cur_slot, b);
+                model.postprocess(objects, slot, b);
                 if (save_output) {
                     auto draw_start = std::chrono::steady_clock::now();
-                    model.draw(images_buf[cur_slot][b], objects);
+                    model.draw(images_buf[slot][b], objects);
                     auto draw_end = std::chrono::steady_clock::now();
-                    video_writer.write(images_buf[cur_slot][b]);
+                    video_writer.write(images_buf[slot][b]);
                     auto write_end = std::chrono::steady_clock::now();
                     total_draw_ms += std::chrono::duration<double, std::milli>(draw_end - draw_start).count();
                     total_write_ms += std::chrono::duration<double, std::milli>(write_end - draw_end).count();
@@ -459,35 +439,35 @@ int main(int argc, char** argv)
             total_post_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(tp1 - tp0).count() / 1000.
                            - (total_draw_ms - draw_ms_before)
                            - (total_write_ms - write_ms_before);
+            frame_count += actual;
+        };
 
-            frame_count += cur_actual;
-            cur_slot = nxt_slot;
-            cur_actual = nxt_actual;
-        }
+        int cur_slot = 0;
+        int cur_actual = load_batch(cur_slot);
+        if (cur_actual == 0) { cap.release(); producer.join(); return 0; }
+        launch_batch(cur_slot, cur_actual);
 
-        // --- Finish last batch ---
-        {
-            auto tp0 = std::chrono::system_clock::now();
-            const double draw_ms_before = total_draw_ms;
-            const double write_ms_before = total_write_ms;
-            for (int b = 0; b < cur_actual; b++) {
-                vector<Detection> objects;
-                model.postprocess(objects, cur_slot, b);
-                if (save_output) {
-                    auto draw_start = std::chrono::steady_clock::now();
-                    model.draw(images_buf[cur_slot][b], objects);
-                    auto draw_end = std::chrono::steady_clock::now();
-                    video_writer.write(images_buf[cur_slot][b]);
-                    auto write_end = std::chrono::steady_clock::now();
-                    total_draw_ms += std::chrono::duration<double, std::milli>(draw_end - draw_start).count();
-                    total_write_ms += std::chrono::duration<double, std::milli>(write_end - draw_end).count();
-                }
+        if (stream_count == 1) {
+            // A slot cannot be reused until its output has been consumed.
+            while (true) {
+                finish_batch(cur_slot, cur_actual);
+                cur_actual = load_batch(cur_slot);
+                if (cur_actual == 0) break;
+                launch_batch(cur_slot, cur_actual);
             }
-            auto tp1 = std::chrono::system_clock::now();
-            total_post_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(tp1 - tp0).count() / 1000.
-                           - (total_draw_ms - draw_ms_before)
-                           - (total_write_ms - write_ms_before);
-            frame_count += cur_actual;
+        } else {
+            while (true) {
+                const int nxt_slot = 1 - cur_slot;
+                const int nxt_actual = load_batch(nxt_slot);
+                if (nxt_actual == 0) break;
+
+                // Let the other stream run while the current batch is consumed.
+                launch_batch(nxt_slot, nxt_actual);
+                finish_batch(cur_slot, cur_actual);
+                cur_slot = nxt_slot;
+                cur_actual = nxt_actual;
+            }
+            finish_batch(cur_slot, cur_actual);
         }
 
         // Cleanup: wait for producer to finish, release resources
@@ -506,7 +486,8 @@ int main(int argc, char** argv)
             printf("Output saved to: %s\n", output_path.c_str());
         }
 
-        printf("--- Dual-stream + Batch%d + AsyncDecode (%d frames) ---\n", B, frame_count);
+        printf("--- %s-stream + Batch%d + AsyncDecode (%d frames) ---\n",
+               stream_count == 1 ? "Single" : "Dual", B, frame_count);
         printf("  preprocess host submit: %.2f ms/frame\n", total_pre_ms / frame_count);
         printf("  inference enqueue:      %.2f ms/batch  (%.2f ms/frame)\n",
                total_inf_ms / batch_count, total_inf_ms / frame_count);
@@ -584,69 +565,65 @@ int main(int argc, char** argv)
         int frame_count = 0;
         int batch_count = 0;
         const int B = model.getBatchSize();
+        const int stream_count = model.getStreamCount();
         auto inference_wall_start = std::chrono::system_clock::now();
         vector<Mat> images_buf[2] = {vector<Mat>(B), vector<Mat>(B)};
 
-        // Load first batch into slot 0
-        int cur_slot = 0, cur_actual = 0;
-        for (int b = 0; b < B; b++) {
-            if (!frame_queue.pop(images_buf[cur_slot][b])) break;
-            cur_actual++;
-        }
-        if (cur_actual == 0) { producer.join(); return 0; }
-
-        auto t0 = std::chrono::system_clock::now();
-        for (int b = 0; b < cur_actual; b++)
-            model.preprocess(images_buf[cur_slot][b], cur_slot, b);
-        auto t1 = std::chrono::system_clock::now();
-        model.infer(cur_slot);
-        batch_count++;
-        auto t2 = std::chrono::system_clock::now();
-        total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.;
-        total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count() / 1000.;
-
-        while (true) {
-            int nxt_slot = 1 - cur_slot;
-            int nxt_actual = 0;
+        auto load_batch = [&](int slot) {
+            int actual = 0;
             for (int b = 0; b < B; b++) {
-                if (!frame_queue.pop(images_buf[nxt_slot][b])) break;
-                nxt_actual++;
+                if (!frame_queue.pop(images_buf[slot][b])) break;
+                actual++;
             }
-            if (nxt_actual == 0) break;
+            return actual;
+        };
 
-            auto pp0 = std::chrono::system_clock::now();
-            for (int b = 0; b < nxt_actual; b++)
-                model.preprocess(images_buf[nxt_slot][b], nxt_slot, b);
-            auto pp1 = std::chrono::system_clock::now();
-            model.infer(nxt_slot);
+        auto launch_batch = [&](int slot, int actual) {
+            auto pre_start = std::chrono::system_clock::now();
+            for (int b = 0; b < actual; b++)
+                model.preprocess(images_buf[slot][b], slot, b);
+            auto pre_end = std::chrono::system_clock::now();
+            model.infer(slot);
+            auto infer_end = std::chrono::system_clock::now();
             batch_count++;
-            auto pp2 = std::chrono::system_clock::now();
-            total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(pp1 - pp0).count() / 1000.;
-            total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(pp2 - pp1).count() / 1000.;
+            total_pre_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(pre_end - pre_start).count() / 1000.;
+            total_inf_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(infer_end - pre_end).count() / 1000.;
+        };
 
+        auto finish_batch = [&](int slot, int actual) {
             auto tp0 = std::chrono::system_clock::now();
-            for (int b = 0; b < cur_actual; b++) {
+            for (int b = 0; b < actual; b++) {
                 vector<Detection> objects;
-                model.postprocess(objects, cur_slot, b);
+                model.postprocess(objects, slot, b);
             }
             auto tp1 = std::chrono::system_clock::now();
             total_post_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(tp1 - tp0).count() / 1000.;
+            frame_count += actual;
+        };
 
-            frame_count += cur_actual;
-            cur_slot = nxt_slot;
-            cur_actual = nxt_actual;
-        }
+        int cur_slot = 0;
+        int cur_actual = load_batch(cur_slot);
+        if (cur_actual == 0) { producer.join(); return 0; }
+        launch_batch(cur_slot, cur_actual);
 
-        // Finish last batch
-        {
-            auto tp0 = std::chrono::system_clock::now();
-            for (int b = 0; b < cur_actual; b++) {
-                vector<Detection> objects;
-                model.postprocess(objects, cur_slot, b);
+        if (stream_count == 1) {
+            while (true) {
+                finish_batch(cur_slot, cur_actual);
+                cur_actual = load_batch(cur_slot);
+                if (cur_actual == 0) break;
+                launch_batch(cur_slot, cur_actual);
             }
-            auto tp1 = std::chrono::system_clock::now();
-            total_post_ms += (double)std::chrono::duration_cast<std::chrono::microseconds>(tp1 - tp0).count() / 1000.;
-            frame_count += cur_actual;
+        } else {
+            while (true) {
+                const int nxt_slot = 1 - cur_slot;
+                const int nxt_actual = load_batch(nxt_slot);
+                if (nxt_actual == 0) break;
+                launch_batch(nxt_slot, nxt_actual);
+                finish_batch(cur_slot, cur_actual);
+                cur_slot = nxt_slot;
+                cur_actual = nxt_actual;
+            }
+            finish_batch(cur_slot, cur_actual);
         }
 
         producer.join();
@@ -655,7 +632,8 @@ int main(int argc, char** argv)
         double wall_sec = std::chrono::duration<double>(inference_wall_end - inference_wall_start).count();
         const FrameQueueStats queue_stats = frame_queue.stats();
 
-        printf("--- Dual-stream + Batch%d + Images (%d frames) ---\n", B, frame_count);
+        printf("--- %s-stream + Batch%d + Images (%d frames) ---\n",
+               stream_count == 1 ? "Single" : "Dual", B, frame_count);
         printf("  preprocess host submit: %.2f ms/frame\n", total_pre_ms / frame_count);
         printf("  inference enqueue:      %.2f ms/batch  (%.2f ms/frame)\n",
                total_inf_ms / batch_count, total_inf_ms / frame_count);
