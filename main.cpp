@@ -11,11 +11,16 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <limits>
 #include <string>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <utility>
 #include <vector>
 #include "YOLOv11.h"
 
@@ -259,16 +264,23 @@ static void printDetailedTiming(const YOLOv11& model)
            static_cast<unsigned long long>(timing.frames));
 }
 
+static void printUsage(const char* executable)
+{
+    printf("Usage:\n");
+    printf("  Build engine:    %s <model.onnx>\n", executable);
+    printf("  Run inference:   %s <model.engine|model.onnx> <video_or_image> [output.mp4]\n",
+           executable);
+    printf("                   [--json <detect.json>]\n");
+    printf("  JSON schema:     XbotGo pipeline step-1 detect.json\n");
+    printf("  Stream mode:     YOLO_NUM_STREAMS=1|2 (default: 2)\n");
+    printf("  Detailed timing: YOLO_DETAILED_TIMING=1\n");
+}
+
 int main(int argc, char** argv)
 {
     // Usage check
-    if (argc < 2 || argc > 4) {
-        printf("Usage:\n");
-        printf("  Build engine:    %s <model.onnx>\n", argv[0]);
-        printf("  Build && infer:  %s <model.onnx> <video_or_image>\n", argv[0]);
-        printf("  Run inference:   %s <model.engine> <video_or_image> [output.mp4]\n", argv[0]);
-        printf("  Stream mode:     YOLO_NUM_STREAMS=1|2 (default: 2)\n");
-        printf("  Detailed timing: YOLO_DETAILED_TIMING=1\n");
+    if (argc < 2) {
+        printUsage(argv[0]);
         return 1;
     }
 
@@ -276,12 +288,10 @@ int main(int argc, char** argv)
     auto program_start_time = std::chrono::system_clock::now();
     const string engine_file_path{ argv[1] };
 
-    // Optional output video path (3rd argument)
+    // Optional inference outputs/options. The first positional argument after
+    // the input remains the legacy output-video path.
     string output_path;
-    bool save_output = (argc >= 4);
-    if (save_output) {
-        output_path = argv[3];
-    }
+    string json_output_path;
 
     // ---- Mode 1: Build engine only (1 argument, .onnx file) ----
     bool is_onnx = engine_file_path.find(".onnx") != std::string::npos;
@@ -298,6 +308,33 @@ int main(int argc, char** argv)
                 std::chrono::system_clock::now() - program_start_time).count());
         return 0;
     }
+
+    for (int i = 3; i < argc; ++i) {
+        const string argument(argv[i]);
+        if (argument == "--json") {
+            if (i + 1 >= argc || json_output_path.size() != 0) {
+                fprintf(stderr, "Error: --json requires exactly one output path.\n");
+                printUsage(argv[0]);
+                return 1;
+            }
+            json_output_path = argv[++i];
+        }
+        else if (argument.rfind("--", 0) == 0) {
+            fprintf(stderr, "Error: unknown option '%s'.\n", argument.c_str());
+            printUsage(argv[0]);
+            return 1;
+        }
+        else if (output_path.empty()) {
+            output_path = argument;
+        }
+        else {
+            fprintf(stderr, "Error: unexpected positional argument '%s'.\n",
+                    argument.c_str());
+            printUsage(argv[0]);
+            return 1;
+        }
+    }
+    const bool save_output = !output_path.empty();
 
     // ---- Mode 2: Inference (2 arguments) ----
     const string path{ argv[2] };
@@ -325,8 +362,23 @@ int main(int argc, char** argv)
         glob(path + "/*.jpg", imagePathList);
     }
 
-    // Assume it's a folder, add logic to handle folders
-    // init model
+    if (!isVideo && imagePathList.empty()) {
+        fprintf(stderr, "Error: no readable video or image input found at %s\n", path.c_str());
+        return 1;
+    }
+
+    if (!json_output_path.empty() && !isVideo) {
+        fprintf(stderr, "Error: --json is only supported for video input.\n");
+        return 1;
+    }
+    if (!json_output_path.empty() &&
+        (json_output_path == engine_file_path ||
+         json_output_path == path ||
+         json_output_path == output_path)) {
+        fprintf(stderr, "Error: JSON output must not overwrite an input or output file.\n");
+        return 1;
+    }
+
     YOLOv11 model(engine_file_path, logger);
 
     if (isVideo) {
@@ -352,6 +404,31 @@ int main(int argc, char** argv)
             }
             printf("Saving output to: %s  (%dx%d @ %.1f FPS)\n",
                    output_path.c_str(), out_w, out_h, out_fps);
+        }
+
+        std::ofstream json_output;
+        bool first_json_frame = true;
+        if (!json_output_path.empty()) {
+            const std::filesystem::path parent =
+                std::filesystem::path(json_output_path).parent_path();
+            if (!parent.empty()) {
+                std::error_code error;
+                std::filesystem::create_directories(parent, error);
+                if (error) {
+                    fprintf(stderr, "Error: cannot create JSON output directory: %s\n",
+                            error.message().c_str());
+                    return 1;
+                }
+            }
+
+            json_output.open(json_output_path, std::ios::out | std::ios::trunc);
+            if (!json_output.is_open()) {
+                fprintf(stderr, "Error: cannot open JSON output: %s\n",
+                        json_output_path.c_str());
+                return 1;
+            }
+            json_output << "[\n"
+                        << std::setprecision(std::numeric_limits<float>::max_digits10);
         }
 
         // ================================================================
@@ -425,6 +502,36 @@ int main(int argc, char** argv)
             for (int b = 0; b < actual; b++) {
                 vector<Detection> objects;
                 model.postprocess(objects, slot, b);
+
+                if (json_output.is_open()) {
+                    const vector<Detection> detections =
+                        model.mapDetectionsToOriginal(images_buf[slot][b].size(), objects);
+
+                    if (!first_json_frame) {
+                        json_output << ",\n";
+                    }
+                    first_json_frame = false;
+
+                    json_output << "  {\"frame_id\": " << frame_count + b
+                                << ", \"Detect4in1\": [";
+                    for (size_t i = 0; i < detections.size(); ++i) {
+                        if (i != 0) {
+                            json_output << ", ";
+                        }
+                        const Detection& detection = detections[i];
+                        const float x2 = detection.bbox.x + detection.bbox.width;
+                        const float y2 = detection.bbox.y + detection.bbox.height;
+
+                        json_output << "{\"cls\": " << detection.class_id
+                                    << ", \"conf\": " << detection.conf
+                                    << ", \"bbox\": ["
+                                    << detection.bbox.x << ", "
+                                    << detection.bbox.y << ", "
+                                    << x2 << ", " << y2 << "]}";
+                    }
+                    json_output << "]}";
+                }
+
                 if (save_output) {
                     auto draw_start = std::chrono::steady_clock::now();
                     model.draw(images_buf[slot][b], objects);
@@ -444,7 +551,15 @@ int main(int argc, char** argv)
 
         int cur_slot = 0;
         int cur_actual = load_batch(cur_slot);
-        if (cur_actual == 0) { cap.release(); producer.join(); return 0; }
+        if (cur_actual == 0) {
+            producer.join();
+            cap.release();
+            if (json_output.is_open()) {
+                json_output << "]\n";
+                json_output.close();
+            }
+            return 0;
+        }
         launch_batch(cur_slot, cur_actual);
 
         if (stream_count == 1) {
@@ -475,6 +590,17 @@ int main(int argc, char** argv)
         cap.release();
         if (save_output) {
             video_writer.release();
+        }
+        if (json_output.is_open()) {
+            json_output << "\n]\n";
+            json_output.close();
+            if (!json_output) {
+                fprintf(stderr, "Error: failed to write JSON output: %s\n",
+                        json_output_path.c_str());
+                return 1;
+            }
+            printf("Detection JSON saved to: %s (%d frames)\n",
+                   json_output_path.c_str(), frame_count);
         }
 
         // Stop end-to-end timing before sorting/reporting diagnostic samples.

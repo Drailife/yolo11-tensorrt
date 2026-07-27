@@ -272,7 +272,7 @@ void YOLOv11::postprocess(vector<Detection>& output, int slot, int batch_idx)
             Detection det;
             det.conf = conf;
             det.class_id = cls;
-            det.bbox = Rect((int)x1, (int)y1, (int)(x2 - x1), (int)(y2 - y1));
+            det.bbox = Rect2f(x1, y1, x2 - x1, y2 - y1);
             output.push_back(det);
         }
         delete[] cpu_output;
@@ -350,9 +350,11 @@ void YOLOv11::postprocess(vector<Detection>& output, int slot, int batch_idx)
     TimingClock::time_point cpu_start;
     if (capture_timing) cpu_start = TimingClock::now();
     vector<Rect> boxes;
+    vector<Rect2f> precise_boxes;
     vector<int> class_ids;
     vector<float> confidences;
     boxes.reserve(filtered_count);
+    precise_boxes.reserve(filtered_count);
     class_ids.reserve(filtered_count);
     confidences.reserve(filtered_count);
 
@@ -371,6 +373,7 @@ void YOLOv11::postprocess(vector<Detection>& output, int slot, int batch_idx)
         box.height = static_cast<int>(h);
 
         boxes.push_back(box);
+        precise_boxes.emplace_back(x, y, w, h);
         class_ids.push_back(cls);
         confidences.push_back(conf);
     }
@@ -384,7 +387,7 @@ void YOLOv11::postprocess(vector<Detection>& output, int slot, int batch_idx)
         int idx = nms_result[i];
         result.class_id = class_ids[idx];
         result.conf = confidences[idx];
-        result.bbox = boxes[idx];
+        result.bbox = precise_boxes[idx];
         output.push_back(result);
     }
     if (capture_timing) {
@@ -397,6 +400,33 @@ void YOLOv11::postprocess(vector<Detection>& output, int slot, int batch_idx)
 void YOLOv11::syncSlot(int slot)
 {
     CUDA_CHECK(cudaStreamSynchronize(streams[slot]));
+}
+
+vector<Detection> YOLOv11::mapDetectionsToOriginal(
+    const Size& image_size,
+    const vector<Detection>& output) const
+{
+    vector<Detection> mapped = output;
+    const float ratio_h = input_h / static_cast<float>(image_size.height);
+    const float ratio_w = input_w / static_cast<float>(image_size.width);
+
+    for (Detection& detection : mapped) {
+        Rect2f& box = detection.bbox;
+        if (ratio_h > ratio_w) {
+            box.x /= ratio_w;
+            box.y = (box.y - (input_h - ratio_w * image_size.height) / 2) / ratio_w;
+            box.width /= ratio_w;
+            box.height /= ratio_w;
+        }
+        else {
+            box.x = (box.x - (input_w - ratio_h * image_size.width) / 2) / ratio_h;
+            box.y /= ratio_h;
+            box.width /= ratio_h;
+            box.height /= ratio_h;
+        }
+    }
+
+    return mapped;
 }
 
 void YOLOv11::build(std::string onnxPath, nvinfer1::ILogger& logger)
@@ -458,31 +488,15 @@ void YOLOv11::build(std::string onnxPath, nvinfer1::ILogger& logger)
 
 void YOLOv11::draw(Mat& image, const vector<Detection>& output)
 {
-    const float ratio_h = input_h / (float)image.rows;
-    const float ratio_w = input_w / (float)image.cols;
+    const vector<Detection> mapped = mapDetectionsToOriginal(image.size(), output);
 
-    for (int i = 0; i < output.size(); i++)
+    for (int i = 0; i < mapped.size(); i++)
     {
-        auto detection = output[i];
+        auto detection = mapped[i];
         auto box = detection.bbox;
         auto class_id = detection.class_id;
         auto conf = detection.conf;
         cv::Scalar color = cv::Scalar(COLORS[class_id][0], COLORS[class_id][1], COLORS[class_id][2]);
-
-        if (ratio_h > ratio_w)
-        {
-            box.x = box.x / ratio_w;
-            box.y = (box.y - (input_h - ratio_w * image.rows) / 2) / ratio_w;
-            box.width = box.width / ratio_w;
-            box.height = box.height / ratio_w;
-        }
-        else
-        {
-            box.x = (box.x - (input_w - ratio_h * image.cols) / 2) / ratio_h;
-            box.y = box.y / ratio_h;
-            box.width = box.width / ratio_h;
-            box.height = box.height / ratio_h;
-        }
 
         rectangle(image, Point(box.x, box.y), Point(box.x + box.width, box.y + box.height), color, 3);
 

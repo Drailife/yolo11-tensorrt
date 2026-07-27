@@ -82,6 +82,33 @@ Perform object detection on a video:
 ./yolov11-tensorrt.exe yolo11s.engine "road.mp4"
 ```
 
+#### 4. Export XbotGo Pipeline Step-1 JSON
+
+Collect every video's post-NMS YOLO result in the `detect.json` schema consumed
+by `XbotGo-AI_Analysis/InfoCombination`:
+
+```bash
+./build/yolov11-tensorrt \
+  models/best.engine \
+  input.mp4 \
+  --json output/input/detect.json
+```
+
+Save the annotated video and JSON in one run:
+
+```bash
+./build/yolov11-tensorrt \
+  models/best.engine \
+  input.mp4 \
+  output/input/detected.mp4 \
+  --json output/input/detect.json
+```
+
+The output directory is created automatically. `frame_id` starts at zero and
+every decoded frame is written, including frames whose `Detect4in1` array is
+empty. Bounding boxes use original-video pixel coordinates in
+`[x1, y1, x2, y2]` order.
+
 ### Single-stream and Dual-stream Modes
 
 Dual-stream mode is used by default. Select the mode with `YOLO_NUM_STREAMS`:

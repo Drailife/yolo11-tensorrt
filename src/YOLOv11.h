@@ -12,7 +12,7 @@ struct Detection
 {
     float conf;
     int class_id;
-    Rect bbox;
+    Rect2f bbox;
 };
 
 struct DetailedTimingStats
@@ -40,6 +40,9 @@ public:
     void infer(int slot);
     void postprocess(vector<Detection>& output, int slot, int batch_idx = 0);
     void syncSlot(int slot);
+    vector<Detection> mapDetectionsToOriginal(
+        const Size& image_size,
+        const vector<Detection>& output) const;
 
     int getBatchSize() const { return batch_size; }    //!< Engine batch size
     int getStreamCount() const { return active_stream_count; }
