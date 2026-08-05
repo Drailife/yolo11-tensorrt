@@ -84,7 +84,8 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
     auto output_dims = engine->getTensorShape(engine->getIOTensorName(1));
     // NMS models output [batch, num_dets, det_attr]; non-NMS output [batch, det_attr, num_dets]
     // Heuristic: if d[2] <= 6, it's NMS format — swap d[1] and d[2]
-    if (output_dims.d[2] <= 6) {
+    bool is_nms_format = (output_dims.d[2] <= 6);
+    if (is_nms_format) {
         num_detections = output_dims.d[1];
         detection_attribute_size = output_dims.d[2];
     } else {
@@ -92,8 +93,9 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
         num_detections = output_dims.d[2];
     }
 #endif
-    // Auto-detect NMS model: if det_attr <= 6, NMS is built into the engine
-    has_nms = (detection_attribute_size <= 6);
+    // Auto-detect NMS model: use the format check, NOT det_attr size
+    // (1-class non-NMS models have det_attr=5 which would falsely trigger has_nms)
+    has_nms = is_nms_format;
     // num_classes only meaningful for non-NMS; NMS output has class_id directly
     num_classes = has_nms ? 0 : detection_attribute_size - 4;
     printf("Model: batch=%d, input=%dx%d, det_attr=%d, num_dets=%d, classes=%d, NMS=%s, streams=%d\n",
