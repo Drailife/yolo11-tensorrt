@@ -40,15 +40,16 @@ cmake .. && make -j
 ## 运行
 
 ```bash
-./build/demo <engine> <video> [output.mp4] [output.json]
+./build/demo <engine> <video> [output.json] [output.mp4] [conf]
 ```
 
 | 参数 | 说明 |
 |------|------|
 | `engine` | TensorRT engine 文件路径（`.engine`），也可传入 `.onnx` 自动构建 |
 | `video` | 输入视频路径 |
-| `output.mp4` | （可选）输出标注视频路径 |
-| `output.json` | （可选）输出检测结果 JSON 路径 |
+| `output.json` | （可选）输出检测结果 JSON 路径，传入 `None` 跳过 |
+| `output.mp4` | （可选）输出标注视频路径，传入 `None` 跳过 |
+| `conf` | （可选）置信度阈值 (0.0~1.0)，默认 0.3 |
 
 ### 示例
 
@@ -56,8 +57,11 @@ cmake .. && make -j
 # 仅推理，不输出文件
 ./build/demo ../../model/yolo11n_with_nms.engine ../../video/test.mp4
 
-# 输出标注视频 + JSON
-./build/demo ../../model/yolo11n_with_nms.engine ../../video/test.mp4 output.mp4 result.json
+# 输出 JSON + 标注视频（跳过不需要的用 None）
+./build/demo ../../model/yolo11n_with_nms.engine ../../video/test.mp4 result.json None
+
+# 指定置信度阈值 0.5，输出 JSON
+./build/demo ../../model/yolo11n_with_nms.engine ../../video/test.mp4 result.json None 0.5
 ```
 
 ## 依赖

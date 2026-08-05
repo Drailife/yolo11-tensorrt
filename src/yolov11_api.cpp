@@ -170,8 +170,9 @@ yolov11_error_t yolov11_export_engine(const char* onnx_path) {
 yolov11_error_t yolov11_detect_video(
     const char* engine_path,
     const char* video_path,
-    const char* output_video_path,
     const char* json_output_path,
+    const char* output_video_path,
+    float conf_threshold,
     yolov11_progress_callback progress_cb,
     void* user_data)
 {
@@ -181,10 +182,10 @@ yolov11_error_t yolov11_detect_video(
         return YOLOV11_ERROR_PARAM;
     }
 
-    const bool save_video = (output_video_path != nullptr &&
-                             std::strlen(output_video_path) > 0);
     const bool save_json  = (json_output_path  != nullptr &&
                              std::strlen(json_output_path)  > 0);
+    const bool save_video = (output_video_path != nullptr &&
+                             std::strlen(output_video_path) > 0);
 
     // Guard against overwriting inputs
     if (save_json &&
@@ -228,6 +229,10 @@ yolov11_error_t yolov11_detect_video(
 
         /* ---------- model ---------- */
         YOLOv11 model(engine_path, g_api_logger);
+        if (conf_threshold > 0.0f) {
+            model.setConfThreshold(conf_threshold);
+            std::printf("Confidence threshold set to: %.2f\n", conf_threshold);
+        }
         const int B = model.getBatchSize();
         const int stream_count = model.getStreamCount();
 
@@ -253,6 +258,10 @@ yolov11_error_t yolov11_detect_video(
         /* ---------- JSON output ---------- */
         std::ofstream json_out;
         bool first_json_frame = true;
+        // 大缓冲区 (4 MB)：对于 3 小时视频 (~300 MB JSON) 仅触发约 75 次 write，
+        // 每次约 10-15 ms，总计不到 1 秒，对推理管线几乎无影响。
+        // 同时内存占用固定为 4 MB，不会随视频时长增长。
+        std::vector<char> json_buf(4 * 1024 * 1024);  // 4 MB
         if (save_json) {
             json_out.open(json_output_path, std::ios::out | std::ios::trunc);
             if (!json_out.is_open()) {
@@ -263,6 +272,7 @@ yolov11_error_t yolov11_detect_video(
                 video_writer.release();
                 return YOLOV11_ERROR_FILE_WRITE;
             }
+            json_out.rdbuf()->pubsetbuf(json_buf.data(), json_buf.size());
             json_out << "[\n"
                      << std::setprecision(std::numeric_limits<float>::max_digits10);
         }

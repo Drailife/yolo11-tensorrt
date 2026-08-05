@@ -72,10 +72,13 @@ yolov11_error_t yolov11_export_engine(const char* onnx_path);
  * @param engine_path       Path to a pre-built `.engine` file (or `.onnx`
  *                          to auto-build the engine first).
  * @param video_path        Path to the input video (mp4 / avi / mov / …).
- * @param output_video_path Path for the output annotated video.
- *                          Pass NULL or "" to skip video generation.
  * @param json_output_path  Path for the per-frame detection JSON file.
  *                          Pass NULL or "" to skip JSON generation.
+ * @param output_video_path Path for the output annotated video.
+ *                          Pass NULL or "" to skip video generation.
+ * @param conf_threshold    Minimum confidence threshold (0.0 ~ 1.0).
+ *                          Detections below this value are discarded.
+ *                          Pass a value <= 0 to use the default (0.3).
  * @param progress_cb       Optional callback invoked after each frame is
  *                          processed.  Pass NULL if not needed.
  * @param user_data         Opaque pointer forwarded to `progress_cb`.
@@ -84,8 +87,9 @@ yolov11_error_t yolov11_export_engine(const char* onnx_path);
 yolov11_error_t yolov11_detect_video(
     const char* engine_path,
     const char* video_path,
-    const char* output_video_path,
     const char* json_output_path,
+    const char* output_video_path,
+    float conf_threshold,
     yolov11_progress_callback progress_cb,
     void* user_data);
 

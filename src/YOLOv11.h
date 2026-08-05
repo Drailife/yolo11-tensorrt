@@ -49,6 +49,9 @@ public:
     bool detailedTimingEnabled() const { return detailed_timing_enabled; }
     const DetailedTimingStats& getDetailedTimingStats() const { return detailed_timing_stats; }
 
+    void setConfThreshold(float threshold) { conf_threshold = threshold; }
+    float getConfThreshold() const { return conf_threshold; }
+
     // ---- Legacy single-stream API (backward compat) ----
     void preprocess(Mat& image) { preprocess(image, 0); }
     void infer()                 { infer(0); }
