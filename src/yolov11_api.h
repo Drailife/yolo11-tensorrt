@@ -93,6 +93,43 @@ yolov11_error_t yolov11_detect_video(
     yolov11_progress_callback progress_cb,
     void* user_data);
 
+/**
+ * @brief Run tracking-guided basketball ball refinement.
+ *
+ * Uses a secondary 640x640 ball-detection engine for crop-based re-detection
+ * of balls missed by the primary YOLO model.  Reads per-event YOLO detections
+ * from ``JsonForLLM_with_objects.json``, processes each event segment of the
+ * video, and outputs refined ball boxes.
+ *
+ * @param events_json_path  Path to JsonForLLM_with_objects.json.
+ * @param video_path        Path to the input video.
+ * @param ball_engine_path  Path to the 640x640 ball-detection .engine file.
+ * @param output_json_path  Path for the aggregate output JSON.
+ * @param detect_stride     Process every N-th frame (>= 1).
+ * @param det_conf          Confidence threshold for crop re-detection (0.0~1.0).
+ * @param ball_cls          Ball class ID in the crop detection model.
+ * @param json_ball_cls     Ball class ID in the input JSON's "Objects" field.
+ * @param max_lookback      Max lookback frames for tracking (default 5).
+ * @param proximity_threshold  Max center distance (pixels) to consider a
+ *                          detection as "covering" a previously tracked ball.
+ * @param progress_cb       Optional callback.  Pass NULL if not needed.
+ * @param user_data         Opaque pointer forwarded to `progress_cb`.
+ * @return YOLOV11_OK on success, or a negative error code.
+ */
+yolov11_error_t yolov11_track_refine(
+    const char* events_json_path,
+    const char* video_path,
+    const char* ball_engine_path,
+    const char* output_json_path,
+    int detect_stride,
+    float det_conf,
+    int ball_cls,
+    int json_ball_cls,
+    int max_lookback,
+    float proximity_threshold,
+    yolov11_progress_callback progress_cb,
+    void* user_data);
+
 #ifdef __cplusplus
 }
 #endif

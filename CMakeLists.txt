@@ -20,6 +20,7 @@ include_directories(src/)
 # -------------------------------------------------------------------
 set(LIB_SOURCES
     src/YOLOv11.cpp
+    src/YoloTrackRefine.cpp
 )
 
 set(CUDA_SOURCES
@@ -29,6 +30,7 @@ set(CUDA_SOURCES
 
 set(HEADERS
     src/YOLOv11.h
+    src/YoloTrackRefine.h
     src/macros.h
     src/logging.h
     src/cuda_utils.h

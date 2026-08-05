@@ -6,6 +6,7 @@
 #include "yolov11_api.h"
 
 #include "YOLOv11.h"
+#include "YoloTrackRefine.h"
 #include "logging.h"
 
 #include <algorithm>
@@ -425,4 +426,58 @@ yolov11_error_t yolov11_detect_video(
     }
 
     return YOLOV11_OK;
+}
+
+/* =================================================================== */
+/*  API: YoloTrackRefine – tracking-guided ball refinement             */
+/* =================================================================== */
+
+yolov11_error_t yolov11_track_refine(
+    const char* events_json_path,
+    const char* video_path,
+    const char* ball_engine_path,
+    const char* output_json_path,
+    int detect_stride,
+    float det_conf,
+    int ball_cls,
+    int json_ball_cls,
+    int max_lookback,
+    float proximity_threshold,
+    yolov11_progress_callback progress_cb,
+    void* user_data)
+{
+    (void)progress_cb;
+    (void)user_data;
+
+    if (events_json_path == nullptr || std::strlen(events_json_path) == 0 ||
+        video_path       == nullptr || std::strlen(video_path)       == 0 ||
+        ball_engine_path == nullptr || std::strlen(ball_engine_path) == 0 ||
+        output_json_path == nullptr || std::strlen(output_json_path) == 0) {
+        return YOLOV11_ERROR_PARAM;
+    }
+
+    if (detect_stride < 1) return YOLOV11_ERROR_PARAM;
+
+    YoloTrackRefineConfig config;
+    config.detectStride       = detect_stride;
+    config.detConf            = det_conf;
+    config.cropSize           = 640;
+    config.maxLookback        = max_lookback;
+    config.proximityThreshold = proximity_threshold;
+    config.yoloConfThresh     = 0.0f;
+    config.ballCls            = ball_cls;
+    config.jsonBallCls        = json_ball_cls;
+
+    try {
+        int ret = YoloTrackRefine::run(
+            events_json_path, video_path, ball_engine_path,
+            output_json_path, config);
+        return (ret == 0) ? YOLOV11_OK : YOLOV11_ERROR_UNKNOWN;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "yolov11_track_refine: exception: %s\n", e.what());
+        return YOLOV11_ERROR_UNKNOWN;
+    } catch (...) {
+        std::fprintf(stderr, "yolov11_track_refine: unknown exception\n");
+        return YOLOV11_ERROR_UNKNOWN;
+    }
 }

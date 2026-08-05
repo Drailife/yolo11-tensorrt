@@ -93,6 +93,25 @@ yolov11_error_t yolov11_detect_video(
     yolov11_progress_callback progress_cb,
     void* user_data);
 
+/**
+ * @brief Run tracking-guided basketball ball refinement.
+ *
+ * @see src/yolov11_api.h for full documentation.
+ */
+yolov11_error_t yolov11_track_refine(
+    const char* events_json_path,
+    const char* video_path,
+    const char* ball_engine_path,
+    const char* output_json_path,
+    int detect_stride,
+    float det_conf,
+    int ball_cls,
+    int json_ball_cls,
+    int max_lookback,
+    float proximity_threshold,
+    yolov11_progress_callback progress_cb,
+    void* user_data);
+
 #ifdef __cplusplus
 }
 #endif

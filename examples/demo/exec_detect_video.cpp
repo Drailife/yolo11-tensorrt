@@ -1,12 +1,12 @@
 /**
- * @file main.cpp
+ * @file exec_detect_video.cpp
  * @brief Minimal C++ demo — uses libyolov11_tensorrt.so to run detection.
  *
  * Build:
  *   mkdir build && cd build && cmake .. && make -j
  *
  * Run (from project root):
- *   ./build/demo <engine> <video> [output.json] [output.mp4] [conf]
+ *   ./build/detect_video <engine> <video> [output.json] [output.mp4] [conf]
  */
 
 #include <chrono>
@@ -18,13 +18,14 @@
 
 static void on_progress(int cur, int total, void* user) {
     (void)user;
-    if (total > 0) {
-        std::printf("\r  Progress: %d / %d  (%.1f%%)", cur, total, 100.0 * cur / total);
-        std::fflush(stdout);
-    } else {
-        std::printf("\r  Progress: %d frames", cur);
-        std::fflush(stdout);
-    }
+    // if (total > 0) {
+    //     std::printf("\r  Progress: %d / %d  (%.1f%%)", cur, total, 100.0 * cur / total);
+    //     std::fflush(stdout);
+    // } else {
+    //     std::printf("\r  Progress: %d frames", cur);
+    //     std::fflush(stdout);
+    // }
+    return;
 }
 
 int main(int argc, char** argv) {
